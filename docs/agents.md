@@ -27,6 +27,24 @@ Most agents receive the **full SDD orchestrator** policy, plus skill files writt
 
 ---
 
+## Provider Config Roots and Environment Semantics
+
+Use this as the quick source of truth when selecting a custom root in CLI/TUI:
+
+| Provider | Default config root | Environment variable | Semantics |
+|----------|---------------------|----------------------|-----------|
+| Claude Code | `~/.claude` | `CLAUDE_CONFIG_DIR` | **Direct root**. If set to `/path/work-claude`, Gentle AI targets `/path/work-claude` (no extra `.claude` appended). |
+| Codex | `~/.codex` | `CODEX_HOME` | **Direct root**. If set to `/path/work-codex`, Gentle AI targets `/path/work-codex` (no extra `.codex` appended). |
+| Gemini CLI | `~/.gemini` | `GEMINI_CLI_HOME` | **Base-home override**. Effective config root is `<GEMINI_CLI_HOME>/.gemini`. |
+| OpenCode | `~/.config/opencode` | N/A (for provider roots) | OpenCode keeps its own runtime/config state under its config root and manages provider profiles/subscriptions internally. |
+
+Gemini references (upstream):
+
+- Configuration reference: <https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md>
+- Enterprise reference (`GEMINI_CLI_HOME` base-home behavior): <https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/enterprise.md>
+
+---
+
 ## Delegation Models
 
 | Model                 | How It Works                                                                                                                                                                                       | Agents                                                                                                    |
