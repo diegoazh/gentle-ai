@@ -2,7 +2,9 @@
 
 ## Outcome
 
-Introduce a single config-root resolution layer that lets Gentle-AI target default or custom provider roots for Claude, Codex, and Gemini CLI while preserving the adapter-driven architecture.
+Introduce a provider profile registry + config-root resolution layer so Gentle-AI can target persisted default/custom provider profiles for Claude, Codex, and Gemini CLI while preserving the adapter-driven architecture.
+
+**Mental model**: profiles are saved targets; env vars are hints.
 
 ## Current Behavior
 
@@ -12,6 +14,7 @@ Introduce a single config-root resolution layer that lets Gentle-AI target defau
 | Codex adapter | Hardcodes paths under `homeDir/.codex` |
 | Gemini adapter | Hardcodes paths under `homeDir/.gemini` |
 | Detection | Uses `adapter.GlobalConfigDir(homeDir)` or fixed scan entries |
+| Profile state | No persisted multi-profile registry per provider |
 | CLI install/sync | Passes one `homeDir` into adapters/components |
 | TUI Agent Builder | Hardcodes Claude/Codex skills and prompt paths directly |
 
@@ -21,14 +24,18 @@ The adapter pattern is good. The missing concept is that `homeDir` is not always
 
 | Decision | Choice | Alternatives | Rationale |
 |----------|--------|--------------|-----------|
+| Source of truth | Persisted provider profile registry | Use current env var per run | `upgrade`/`sync` may run without alias-scoped env; durable intent must survive process env. |
 | Root abstraction | Add provider config-root resolver | Add ad-hoc Claude-only env checks | A shared resolver avoids duplicating path logic across install, sync, TUI, Agent Builder, and uninstall. |
-| Root semantics | Treat provider env vars as direct provider config roots | Append default subdirectories to env roots | The provider runtime owns env var semantics. For Claude, `CLAUDE_CONFIG_DIR=/path/.claude-work` means Claude reads `/path/.claude-work`, not `/path/.claude-work/.claude`. |
+| Root semantics | Treat provider env vars as candidates, not authoritative selection | Auto-apply env value | Users may keep both `work` and `personal` profiles regardless of current shell env. |
+| Claude semantics | `CLAUDE_CONFIG_DIR` is direct config root candidate | Append `.claude` | Claude runtime reads env value directly. |
 | Default behavior | Preserve current `~/.claude` and `~/.codex` | Force prompt every install | Backwards compatibility matters; users without custom roots should see no behavior change. |
 | Claude env detection | Use `CLAUDE_CONFIG_DIR` as candidate | Ignore env vars | The session env is a strong signal that the user is running in a non-default Claude profile. |
 | Codex env detection | Use `CODEX_HOME` as a direct config-root candidate | Manual-only Codex support | Codex docs and installed binary confirm `CODEX_HOME` controls config/auth home and defaults to `~/.codex`. |
 | Gemini env detection | Use `GEMINI_CLI_HOME` as base-home candidate and resolve `<base>/.gemini` | Treat `GEMINI_CLI_HOME` as direct config root | Official Gemini docs define `~/.gemini` as config location and document `GEMINI_CLI_HOME` as a unique home/base directory where Gemini creates/uses `.gemini`. |
+| Canonical management surfaces | CLI + TUI profile management; sync/upgrade are opportunistic only | Manage profiles implicitly in sync | Clear UX boundaries reduce repeated prompts and accidental writes. |
 | TUI integration | Shared resolver/state consumed by screens | TUI-only duplicate logic | CLI and TUI must behave consistently. |
 | Agent Builder | Replace hardcoded paths with resolver/adapter paths | Leave as follow-up | Leaving hardcoded paths would silently write custom agents to the wrong account. |
+| OpenCode scope | Document difference only; no provider-root semantics added | Force same registry model into OpenCode | OpenCode already has internal provider profiles/subscriptions. |
 
 ## Proposed Types
 
@@ -58,6 +65,17 @@ type ConfigRootSelection struct {
     BasePath  string
     ConfigDir string
 }
+
+type ProviderProfile struct {
+    AgentID       model.AgentID
+    Name          string // e.g., work, personal
+    Source        ConfigRootSource
+    BasePath      string
+    ConfigDir     string
+    Stale         bool
+    StaleReason   string
+    LastValidated string
+}
 ```
 
 The exact package is implementation-defined, but `internal/agents` or a small `internal/configroots` package are good candidates. Avoid putting this in `system` if it creates an import cycle with adapters.
@@ -65,6 +83,14 @@ The exact package is implementation-defined, but `internal/agents` or a small `i
 ## Resolver Flow
 
 ```text
+Load profiles from registry
+  │
+  ├─ if none for provider: include default profile candidate
+  │
+  ├─ resolve/validate registered profiles
+  │
+  └─ detect env/manual candidates as optional additions
+
 Resolve candidates(agent, osHome, env)
   │
   ├─ default candidate
@@ -80,7 +106,7 @@ Resolve candidates(agent, osHome, env)
   └─ optional manual candidate
        validate provider-specific layout
 
-User/CLI/TUI selects candidate
+CLI/TUI selects registered profile (or registers candidate first)
   │
   ▼
 Selection passed into install/sync/uninstall runtime
@@ -161,6 +187,12 @@ Hardcoding `CLAUDE_CONFIG_DIR` inside individual component functions. That repea
 CLI should support automation. Candidate names are examples and can be adjusted during implementation:
 
 ```text
+gentle-ai profiles add claude-code ~/.claude-work --name work
+gentle-ai profiles add claude-code ~/.claude-personal --name personal
+gentle-ai profiles list
+gentle-ai profiles update claude-code --name work --path ~/.claude-work-v2
+gentle-ai profiles remove claude-code --name personal
+
 gentle-ai install --agent claude-code --agent-config-root claude-code=/Users/me/.claude-work
 gentle-ai sync --agent-config-root claude-code=/Users/me/.claude-work
 gentle-ai install --use-provider-env-roots
@@ -172,6 +204,8 @@ Dry runs SHOULD include:
 Claude Code config root: /Users/me/.claude-work (source: environment CLAUDE_CONFIG_DIR)
 Gemini CLI config root: /Users/me/gemini-work/.gemini (source: environment GEMINI_CLI_HOME)
 ```
+
+Upgrade/sync MAY opportunistically ask to register env-detected roots not yet in registry.
 
 ## TUI Design
 
@@ -190,6 +224,16 @@ Gentle-AI writes prompts, skills, MCP config, commands, output styles, and sub-a
 It does not switch your Claude login.
 ```
 
+Canonical management flow:
+
+```text
+Settings → Manage provider profiles
+  - Add profile
+  - Edit profile path/name
+  - Remove profile
+  - Show stale status and repair actions
+```
+
 Manual path entry must validate before moving forward.
 
 ## State and Uninstall
@@ -202,6 +246,8 @@ State should record at least:
 - source
 - selected base path
 - resolved config dir
+- profile name
+- stale status (when path disappears)
 
 Uninstall must prefer saved selections for managed files. This is important because uninstalling from `~/.claude` after installing to `~/.claude-work/.claude` would look successful but leave managed files behind.
 
@@ -233,9 +279,9 @@ Add a user-facing section to the install/sync docs explaining:
 
 This should be implemented in slices because it touches core pathing and UX:
 
-1. Resolver + Claude/Codex/Gemini path tests with default parity.
-2. CLI install/sync path selection.
-3. TUI root selection.
+1. Profile registry foundation + resolver + Claude/Codex/Gemini path tests with default parity.
+2. CLI profile CRUD + install/sync path selection.
+3. TUI profile management + selection UX.
 4. Agent Builder hardcoded path cleanup.
-5. Uninstall/saved selection continuity.
+5. Uninstall/saved selection continuity + stale profile handling.
 6. Documentation.

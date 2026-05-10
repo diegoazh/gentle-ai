@@ -29,7 +29,9 @@ Most agents receive the **full SDD orchestrator** policy, plus skill files writt
 
 ## Provider Config Roots and Environment Semantics
 
-Use this as the quick source of truth when selecting a custom root in CLI/TUI:
+**Answer first:** provider profiles are saved targets; env vars are hints.
+
+Use this as the quick source of truth when selecting or registering roots in CLI/TUI:
 
 | Provider | Default config root | Environment variable | Semantics |
 |----------|---------------------|----------------------|-----------|
@@ -37,6 +39,22 @@ Use this as the quick source of truth when selecting a custom root in CLI/TUI:
 | Codex | `~/.codex` | `CODEX_HOME` | **Direct root**. If set to `/path/work-codex`, Gentle AI targets `/path/work-codex` (no extra `.codex` appended). |
 | Gemini CLI | `~/.gemini` | `GEMINI_CLI_HOME` | **Base-home override**. Effective config root is `<GEMINI_CLI_HOME>/.gemini`. |
 | OpenCode | `~/.config/opencode` | N/A (for provider roots) | OpenCode keeps its own runtime/config state under its config root and manages provider profiles/subscriptions internally. |
+
+### Canonical management surfaces
+
+- **CLI**: `gentle-ai profiles add|list|remove|update`
+- **TUI**: `Manage provider profiles`
+- `upgrade` / `sync` may suggest registration for detected env paths, but they are **not** the canonical profile management surface.
+
+### Example: Claude work + personal profiles
+
+```bash
+gentle-ai profiles add claude-code ~/.claude-work --name work
+gentle-ai profiles add claude-code ~/.claude-personal --name personal
+gentle-ai profiles list
+```
+
+If `CLAUDE_CONFIG_DIR` is detected during `sync`/`upgrade` and is not registered, Gentle AI should ask whether to register it.
 
 Gemini references (upstream):
 

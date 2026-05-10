@@ -4,9 +4,32 @@
 
 Define the behavior required for Gentle-AI to safely target default or custom provider configuration roots for Claude Code, Codex, and Gemini CLI without breaking existing installs.
 
+**Mental model**: provider profiles are saved targets; environment variables are hints.
+
 ---
 
-## 1. Root Model
+## 1. Provider Profile Registry Model
+
+### Requirement: Registry Is Source of Truth
+
+Gentle-AI MUST treat a persisted provider profile registry as the source of truth for install/sync/upgrade targets.
+Environment variables MUST be treated as detection hints only.
+
+#### Scenario: Env var exists but no registered profile
+
+- GIVEN `CLAUDE_CONFIG_DIR=/Users/me/.claude-work`
+- AND no Claude `work` profile is registered
+- WHEN `gentle-ai sync` runs
+- THEN Gentle-AI informs the user that an unregistered env candidate was detected
+- AND asks whether to register it and/or add other profiles
+- AND does not silently replace registry state with env state
+
+#### Scenario: Multiple profiles for same provider
+
+- GIVEN provider `claude-code` has profiles `work` and `personal`
+- WHEN the user runs install/sync
+- THEN Gentle-AI can target either profile explicitly
+- AND both profiles remain persisted for future runs
 
 ### Requirement: Config Root Candidate
 
@@ -55,6 +78,23 @@ The system MUST resolve environment variables according to what the provider run
 - WHEN the root is normalized for Gemini CLI
 - THEN the resolved provider config directory is `/tmp/gemini-job-123/.gemini`
 - AND Gentle-AI MUST append exactly one `.gemini` segment to the cleaned base path
+
+---
+
+## 1.1 Registry Health and Stale Paths
+
+### Requirement: Missing Registered Path Handling
+
+If a registered profile path no longer exists, Gentle-AI MUST warn and skip writes to that target until repaired.
+
+#### Scenario: Registered profile path disappears
+
+- GIVEN profile `claude-code/work` points to `/Users/me/.claude-work`
+- AND that path no longer exists
+- WHEN `gentle-ai upgrade` or `gentle-ai sync` runs
+- THEN Gentle-AI warns that this profile will not be updated
+- AND marks or removes the entry as stale in registry state
+- AND shows how to re-add/update it later
 
 ---
 
@@ -186,6 +226,34 @@ This requirement is source-backed by Gemini CLI upstream docs: configuration ref
 
 ## 5. CLI Behavior
 
+### Requirement: Profile Registry Commands
+
+The CLI MUST provide canonical profile management commands.
+
+#### Scenario: Add profile
+
+- GIVEN the user runs `gentle-ai profiles add claude-code ~/.claude-work --name work`
+- WHEN validation succeeds
+- THEN profile `claude-code/work` is persisted
+
+#### Scenario: List profiles
+
+- GIVEN saved profiles exist
+- WHEN the user runs `gentle-ai profiles list`
+- THEN the CLI shows provider, profile name, path, status, and source
+
+#### Scenario: Remove profile
+
+- GIVEN profile `claude-code/personal` exists
+- WHEN the user runs `gentle-ai profiles remove claude-code --name personal`
+- THEN that profile is removed from registry
+
+#### Scenario: Update profile path
+
+- GIVEN profile `claude-code/work` exists
+- WHEN the user runs `gentle-ai profiles update claude-code --name work --path ~/.claude-work-new`
+- THEN registry path is updated after validation
+
 ### Requirement: Non-Interactive Root Selection
 
 The CLI MUST expose a non-interactive way to choose provider config roots for automation.
@@ -206,9 +274,32 @@ The CLI SHOULD print or report the resolved provider write target before applyin
 - WHEN the plan is shown
 - THEN the output includes the resolved Claude config directory
 
+### Requirement: Opportunistic Registration During Upgrade/Sync
+
+Upgrade/sync MAY offer registration when env candidates are detected, but MUST NOT replace CLI/TUI profile management as canonical surfaces.
+
+#### Scenario: Detected env candidate offered for registration
+
+- GIVEN `CODEX_HOME=/Users/me/.codex-work`
+- AND no matching Codex profile exists
+- WHEN `gentle-ai sync` runs
+- THEN Gentle-AI asks whether to register this path
+- AND may offer adding additional profiles
+- AND keeps canonical profile CRUD under `gentle-ai profiles ...` and TUI manage flow
+
 ---
 
 ## 6. TUI Behavior
+
+### Requirement: Profile Management Screen
+
+The TUI MUST provide a canonical `Manage provider profiles` flow for profile CRUD.
+
+#### Scenario: Manage profiles in TUI
+
+- GIVEN the user opens provider profile management
+- WHEN they add/edit/remove a profile
+- THEN registry state is persisted and used by future install/sync/upgrade runs
 
 ### Requirement: Root Selection Screen
 
@@ -294,7 +385,7 @@ When a root selection is applied, Gentle-AI SHOULD persist enough state for late
 
 ### Requirement: User Guide
 
-Documentation MUST explain how to use custom provider roots for personal/work accounts.
+Documentation MUST explain that profiles are persisted targets and env vars are hints, including personal/work examples.
 
 #### Scenario: Claude work/personal example
 
@@ -311,6 +402,10 @@ Documentation MUST explain how to use custom provider roots for personal/work ac
 ### Requirement: Safety Notes
 
 Documentation MUST warn users that Gentle-AI does not switch provider authentication; it only targets where managed files are written.
+
+### Requirement: OpenCode Difference
+
+Documentation MUST state that OpenCode remains different: OpenCode manages provider profiles/subscriptions internally and Gentle-AI MUST NOT invent provider-root semantics for OpenCode.
 
 ---
 
