@@ -883,7 +883,12 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 			case model.StrategySeparateMCPFiles:
 				paths = append(paths, adapter.MCPConfigPath(targetDir, "engram"))
 			case model.StrategyMergeIntoSettings:
-				if p := adapter.SettingsPath(targetDir); p != "" {
+				// MCP settings are always merged into the global config file, not the
+				// workspace-scoped directory. For OpenClaw, SettingsPath(targetDir)
+				// would yield <workspace>/.openclaw/openclaw.json, but engram injection
+				// writes to the canonical ~/.openclaw/openclaw.json (homeDir). Use
+				// homeDir here so the verification path matches the actual write target.
+				if p := adapter.SettingsPath(homeDir); p != "" {
 					paths = append(paths, p)
 				}
 			case model.StrategyMCPConfigFile:
@@ -918,7 +923,10 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 				if p := adapter.SettingsPath(homeDir); p != "" {
 					paths = append(paths, p)
 				}
-				paths = append(paths, filepath.Join(homeDir, ".config", "opencode", "plugins", "background-agents.ts"))
+				paths = append(paths,
+					filepath.Join(homeDir, ".config", "opencode", "plugins", "background-agents.ts"),
+					filepath.Join(homeDir, ".config", "opencode", "plugins", "model-variants.ts"),
+				)
 				// Shared prompt files in ~/.config/opencode/prompts/sdd/ — back these up
 				// so a sync does not silently overwrite user-customized prompt content.
 				// These files are only written for multi-mode (SDDModeMulti), so we only
@@ -1312,6 +1320,11 @@ func claudeAliasesToStrings(m map[string]model.ClaudeModelAlias) map[string]stri
 	}
 	out := make(map[string]string, len(m))
 	for k, v := range m {
+		// Claude Code owns the main session/orchestrator model; do not persist it
+		// as a Gentle AI model assignment.
+		if k == "orchestrator" {
+			continue
+		}
 		out[k] = string(v)
 	}
 	return out
@@ -1325,7 +1338,7 @@ func modelAssignmentsToState(m map[string]model.ModelAssignment) map[string]stat
 	}
 	out := make(map[string]state.ModelAssignmentState, len(m))
 	for k, v := range m {
-		out[k] = state.ModelAssignmentState{ProviderID: v.ProviderID, ModelID: v.ModelID}
+		out[k] = state.ModelAssignmentState{ProviderID: v.ProviderID, ModelID: v.ModelID, Effort: v.Effort}
 	}
 	return out
 }

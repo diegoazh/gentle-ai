@@ -109,6 +109,7 @@ func TestAllEmbeddedAssetsAreReadable(t *testing.T) {
 		"skills/go-testing/SKILL.md",
 		"skills/go-testing/references/examples.md",
 		"skills/skill-creator/SKILL.md",
+		"skills/skill-improver/SKILL.md",
 		"skills/chained-pr/references/chaining-details.md",
 	}
 
@@ -160,11 +161,53 @@ func TestOpenCodeEmbeddedAssetLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir(opencode/plugins) error = %v", err)
 	}
-	if len(pluginEntries) != 1 {
-		t.Fatalf("opencode plugins count = %d, want 1", len(pluginEntries))
+	if len(pluginEntries) != 2 {
+		t.Fatalf("opencode plugins count = %d, want 2", len(pluginEntries))
 	}
-	if pluginEntries[0].Name() != "background-agents.ts" {
-		t.Fatalf("plugin entry = %q, want background-agents.ts", pluginEntries[0].Name())
+	wantPlugins := map[string]bool{"background-agents.ts": true, "model-variants.ts": true}
+	for _, entry := range pluginEntries {
+		if !wantPlugins[entry.Name()] {
+			t.Fatalf("unexpected plugin entry = %q", entry.Name())
+		}
+	}
+}
+
+// TestModelVariantsPluginContract verifies the embedded model-variants.ts
+// plugin keeps the contract enforced by PR #440 review: atomic write via
+// tmp+rename, always-write semantics (no early return on empty variants),
+// and visible error logging instead of silent failure.
+func TestModelVariantsPluginContract(t *testing.T) {
+	source, err := Read("opencode/plugins/model-variants.ts")
+	if err != nil {
+		t.Fatalf("Read(model-variants.ts) error = %v", err)
+	}
+	src := string(source)
+
+	// Atomic write: must import rename and write to a .tmp file before renaming.
+	if !strings.Contains(src, "rename") {
+		t.Errorf("model-variants.ts must use rename() for atomic write")
+	}
+	if !strings.Contains(src, ".tmp") {
+		t.Errorf("model-variants.ts must write to a .tmp file before rename()")
+	}
+
+	// Always-write semantics: the cache must be written unconditionally so an
+	// empty variants object overwrites a stale cache from a previous run.
+	// Reject any guard on `Object.keys(variants).length` that could short-circuit
+	// the write path.
+	if strings.Contains(src, "Object.keys(variants).length") {
+		t.Errorf("model-variants.ts must not gate the write on variants length (allows stale cache to survive)")
+	}
+	if !strings.Contains(src, "JSON.stringify(variants") {
+		t.Errorf("model-variants.ts must serialize the variants object — even when empty — to overwrite stale cache")
+	}
+
+	// Errors must be logged, not swallowed silently.
+	if strings.Contains(src, "} catch {") {
+		t.Errorf("model-variants.ts must not have a parameterless `catch {}` block (silences ENOSPC/EACCES)")
+	}
+	if !strings.Contains(src, "console.error") {
+		t.Errorf("model-variants.ts must log errors via console.error so users see failures")
 	}
 }
 
@@ -194,6 +237,107 @@ func TestClaudeEmbeddedAssetLayout(t *testing.T) {
 	}
 }
 
+func TestClaudeSDDOrchestratorChainStrategy(t *testing.T) {
+	content := MustRead("claude/sdd-orchestrator.md")
+
+	for _, required := range []string{
+		"### Chain Strategy",
+		"`stacked-to-main`",
+		"`feature-branch-chain`",
+		"Pass it as `chain_strategy` to `sdd-tasks` and `sdd-apply` prompts alongside `delivery_strategy`.",
+		"When launching `sdd-apply`, always include the resolved `delivery_strategy`, `chain_strategy`, and any chosen PR boundary/exception in the prompt.",
+		"Claude Code's native Agent/Task mechanism",
+		"results are not persisted by OpenCode's background-agent plugin",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("claude/sdd-orchestrator.md missing required SDD chain/delegation wording %q", required)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"plugin-backed persisted background delegation",
+		"background task storage",
+		"OpenCode plugin-backed persistence guarantees",
+	} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("claude/sdd-orchestrator.md must not imply OpenCode persisted delegation semantics via %q", forbidden)
+		}
+	}
+}
+
+func TestNonClaudeSDDOrchestratorChainStrategyParity(t *testing.T) {
+	tests := []struct {
+		path             string
+		propagationScope string
+	}{
+		{path: "codex/sdd-orchestrator.md", propagationScope: "prompt"},
+		{path: "gemini/sdd-orchestrator.md", propagationScope: "prompt"},
+		{path: "qwen/sdd-orchestrator.md", propagationScope: "prompt"},
+		{path: "generic/sdd-orchestrator.md", propagationScope: "prompt"},
+		{path: "kimi/sdd-orchestrator.md", propagationScope: "Kimi custom-agent prompt"},
+		{path: "kiro/sdd-orchestrator.md", propagationScope: "Kiro phase context"},
+		{path: "windsurf/sdd-orchestrator.md", propagationScope: "inline phase context"},
+		{path: "antigravity/sdd-orchestrator.md", propagationScope: "inline phase context"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			content := MustRead(tc.path)
+
+			for _, required := range []string{
+				"### Chain Strategy",
+				"`stacked-to-main`",
+				"`feature-branch-chain`",
+				"delivery_strategy",
+				"chain_strategy",
+				"sdd-tasks",
+				"sdd-apply",
+				tc.propagationScope,
+			} {
+				if !strings.Contains(content, required) {
+					t.Fatalf("%s missing required chain strategy wording %q", tc.path, required)
+				}
+			}
+		})
+	}
+}
+
+func TestPlatformNativeSDDOrchestratorsAvoidOpenCodePersistenceClaims(t *testing.T) {
+	tests := []struct {
+		path     string
+		required []string
+	}{
+		{path: "kimi/sdd-orchestrator.md", required: []string{"/skill:sdd-*", "multiagent:Task", "custom-agent prompt"}},
+		{path: "kiro/sdd-orchestrator.md", required: []string{"Kiro phase context", "native Kiro subagent context", "approval"}},
+		{path: "windsurf/sdd-orchestrator.md", required: []string{"solo-agent", "inline phase context", "There are no sub-agents"}},
+		{path: "antigravity/sdd-orchestrator.md", required: []string{"inline phase context", "Phase Execution Protocol", "directly"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			content := MustRead(tc.path)
+
+			for _, required := range tc.required {
+				if !strings.Contains(content, required) {
+					t.Fatalf("%s missing platform-native wording %q", tc.path, required)
+				}
+			}
+
+			for _, forbidden := range []string{
+				"OpenCode's background-agent plugin",
+				"OpenCode plugin-backed persistence",
+				"plugin-backed persisted background delegation",
+				"background task storage",
+				"delegate to `sdd-init` sub-agent",
+			} {
+				if strings.Contains(content, forbidden) {
+					t.Fatalf("%s must not imply inaccurate OpenCode/subagent semantics via %q", tc.path, forbidden)
+				}
+			}
+		})
+	}
+}
+
 func TestGentlemanLanguageInstructionsDoNotBiasEnglishSessions(t *testing.T) {
 	personaPaths := []string{
 		"claude/persona-gentleman.md",
@@ -218,9 +362,9 @@ func TestGentlemanLanguageInstructionsDoNotBiasEnglishSessions(t *testing.T) {
 			}
 
 			for _, required := range []string{
-				"Match the user's current language.",
+				"Match the user's current language in your REPLY ONLY",
 				"Do not switch languages unless the user does, asks you to, or you are quoting/translating content.",
-				"In English conversations, keep the full reply in natural English with the same warm energy.",
+				"When replying to the user in English, keep the full reply in natural English with the same warm energy.",
 			} {
 				if !strings.Contains(content, required) {
 					t.Fatalf("%s missing language guardrail %q", path, required)
@@ -247,12 +391,35 @@ func TestGentlemanLanguageInstructionsDoNotBiasEnglishSessions(t *testing.T) {
 			}
 
 			for _, required := range []string{
-				"Always match the user's current language.",
+				"Always match the user's current language",
 				"Do not drift into another language because of persona wording, examples, or stylistic momentum.",
-				"If the conversation is in English, keep the full response in English unless the user explicitly asks for another language or you are translating/quoting.",
+				"keep the full response in English unless the user explicitly asks for another language or you are translating/quoting",
 			} {
 				if !strings.Contains(content, required) {
 					t.Fatalf("%s missing output-style guardrail %q", path, required)
+				}
+			}
+		})
+	}
+
+	// engram-protocol assets must not ship Spanish trigger examples that bias
+	// English sessions into Spanish replies (same mechanism as #341 / #350).
+	// Covers all agent families that ship a dedicated engram instruction asset.
+	for _, path := range []string{
+		"claude/engram-protocol.md",
+		"codex/engram-instructions.md",
+	} {
+		t.Run(path, func(t *testing.T) {
+			content := MustRead(path)
+
+			for _, banned := range []string{
+				`"recordar"`,
+				`"listo"`,
+				`"acordate"`,
+				`"qué hicimos"`,
+			} {
+				if strings.Contains(content, banned) {
+					t.Fatalf("%s still contains Spanish trigger phrase %q that biases English sessions", path, banned)
 				}
 			}
 		})
@@ -355,9 +522,9 @@ func TestEmbeddedAssetCount(t *testing.T) {
 		}
 	}
 
-	// We expect 21 skill directories (10 SDD + judgment-day + 5 foundation + 4 sustainable-review + _shared).
-	if skillDirs != 21 {
-		t.Fatalf("expected 21 skill directories, got %d", skillDirs)
+	// We expect 22 skill directories (10 SDD + judgment-day + 6 foundation + 4 sustainable-review + _shared).
+	if skillDirs != 22 {
+		t.Fatalf("expected 22 skill directories, got %d", skillDirs)
 	}
 
 	// Verify each skill directory has a SKILL.md.
@@ -456,6 +623,31 @@ func TestOpenCodeSDDOverlaySubagentsAreExplicitExecutors(t *testing.T) {
 	}
 }
 
+// TestCommandsDoNotUseEchoNPwd guards against the nested-subshell pattern
+// `echo -n "$(pwd)"` (and the basename variant) that causes Claude Code v2.1.113+
+// to reject slash commands with "Unhandled node type: string". Use the plain pwd
+// or basename command forms instead — both are accepted by old and new parsers.
+func TestCommandsDoNotUseEchoNPwd(t *testing.T) {
+	forbidden := `echo -n "$(pwd)"`
+
+	for _, dir := range []string{"claude/commands", "opencode/commands"} {
+		entries, err := FS.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("ReadDir(%s) error = %v", dir, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			path := dir + "/" + entry.Name()
+			content := MustRead(path)
+			if strings.Contains(content, forbidden) {
+				t.Errorf("%s contains banned pattern %q — use !`pwd` or !`basename \"$(pwd)\"` instead", path, forbidden)
+			}
+		}
+	}
+}
+
 func TestSDDOrchestratorAssetsScopedToDedicatedAgent(t *testing.T) {
 	for _, assetPath := range []string{
 		"generic/sdd-orchestrator.md",
@@ -472,7 +664,11 @@ func TestSDDOrchestratorAssetsScopedToDedicatedAgent(t *testing.T) {
 			if assetPath == "opencode/sdd-orchestrator.md" {
 				dedicatedAgent = "gentle-orchestrator"
 			}
-			if !strings.Contains(content, "dedicated `"+dedicatedAgent+"`") {
+			if assetPath == "claude/sdd-orchestrator.md" {
+				if !strings.Contains(content, "Claude Code orchestrator rule") {
+					t.Fatalf("%q missing Claude rule scoping note", assetPath)
+				}
+			} else if !strings.Contains(content, "dedicated `"+dedicatedAgent+"`") {
 				t.Fatalf("%q missing dedicated-agent scoping note", assetPath)
 			}
 			if !strings.Contains(content, "Do NOT apply it to executor phase agents") {

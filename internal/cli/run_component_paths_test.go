@@ -44,27 +44,31 @@ func TestComponentPathsSDDIncludesOpenCodeSettingsAndCommands(t *testing.T) {
 	}
 }
 
-func TestComponentPathsSDDMultiIncludesOpenCodePlugin(t *testing.T) {
+func TestComponentPathsSDDMultiIncludesOpenCodePlugins(t *testing.T) {
 	home := t.TempDir()
 	adapters := resolveAdapters([]model.AgentID{model.AgentOpenCode})
 
 	paths := componentPaths(home, model.Selection{SDDMode: model.SDDModeMulti}, adapters, model.ComponentSDD)
 
-	plugin := filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts")
-	if !containsPath(paths, plugin) {
-		t.Fatalf("componentPaths(sdd multi) missing OpenCode plugin path %q\npaths=%v", plugin, paths)
+	for _, plugin := range []string{"background-agents.ts", "model-variants.ts"} {
+		path := filepath.Join(home, ".config", "opencode", "plugins", plugin)
+		if !containsPath(paths, path) {
+			t.Fatalf("componentPaths(sdd multi) missing OpenCode plugin path %q\npaths=%v", path, paths)
+		}
 	}
 }
 
-func TestComponentPathsSDDSingleIncludesOpenCodePlugin(t *testing.T) {
+func TestComponentPathsSDDSingleIncludesOpenCodePlugins(t *testing.T) {
 	home := t.TempDir()
 	adapters := resolveAdapters([]model.AgentID{model.AgentOpenCode})
 
 	paths := componentPaths(home, model.Selection{SDDMode: model.SDDModeSingle}, adapters, model.ComponentSDD)
 
-	plugin := filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts")
-	if !containsPath(paths, plugin) {
-		t.Fatalf("componentPaths(sdd single) missing OpenCode plugin path %q\npaths=%v", plugin, paths)
+	for _, plugin := range []string{"background-agents.ts", "model-variants.ts"} {
+		path := filepath.Join(home, ".config", "opencode", "plugins", plugin)
+		if !containsPath(paths, path) {
+			t.Fatalf("componentPaths(sdd single) missing OpenCode plugin path %q\npaths=%v", path, paths)
+		}
 	}
 }
 
@@ -196,6 +200,32 @@ func TestComponentPathsEngramCodexIncludesConfigTOML(t *testing.T) {
 	want := filepath.Join(home, ".codex", "config.toml")
 	if !containsPath(paths, want) {
 		t.Fatalf("componentPaths(engram,codex) missing %q\npaths=%v", want, paths)
+	}
+}
+
+// TestComponentPathsEngramOpenClawUsesCanonicalSettingsPath asserts that the
+// engram component path for OpenClaw always resolves to the canonical
+// ~/.openclaw/openclaw.json and never to a workspace-scoped copy.
+//
+// This is a regression test for issue #522: the verifier used to call
+// SettingsPath(workspaceDir) which produced
+// <workspace>/.openclaw/openclaw.json, causing post-sync verification to
+// fail even when the file at the canonical path existed.
+func TestComponentPathsEngramOpenClawUsesCanonicalSettingsPath(t *testing.T) {
+	home := t.TempDir()
+	workspace := t.TempDir()
+	adapters := resolveAdapters([]model.AgentID{model.AgentOpenClaw})
+
+	paths := componentPathsWithWorkspace(home, workspace, model.Selection{}, adapters, model.ComponentEngram)
+
+	canonical := filepath.Join(home, ".openclaw", "openclaw.json")
+	if !containsPath(paths, canonical) {
+		t.Fatalf("componentPathsWithWorkspace(engram,openclaw) missing canonical path %q\npaths=%v", canonical, paths)
+	}
+
+	wrongPath := filepath.Join(workspace, ".openclaw", "openclaw.json")
+	if containsPath(paths, wrongPath) {
+		t.Fatalf("componentPathsWithWorkspace(engram,openclaw) must not include workspace-scoped path %q\npaths=%v", wrongPath, paths)
 	}
 }
 

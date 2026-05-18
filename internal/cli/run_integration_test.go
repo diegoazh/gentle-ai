@@ -17,6 +17,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/installcmd"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/internal/versions"
 )
 
 // missingBinaryLookPath simulates all installable binaries (engram, gga) as
@@ -91,10 +92,24 @@ func TestRunInstallEngramForPiAndOpenCodeProvisionsBothMCPTargets(t *testing.T) 
 	cmdLookPath = func(name string) (string, error) {
 		return filepath.Join(home, "bin", name), nil
 	}
+	restorePreflightLookPath := installcmd.OverrideLookPath(func(name string) (string, error) {
+		return filepath.Join(home, "bin", name), nil
+	})
+	t.Cleanup(restorePreflightLookPath)
 
 	var commands []string
 	runCommand = func(name string, args ...string) error {
 		commands = append(commands, strings.Join(append([]string{name}, args...), " "))
+		// Simulate pi-engram init writing mcp.json with the new schema.
+		if name == "npm" && len(args) >= 7 && args[5] == "pi-engram" && args[6] == "init" {
+			mcpPath := filepath.Join(home, ".pi", "agent", "mcp.json")
+			if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(mcpPath, []byte(`{"activeMCP":"engram","mcpServers":{"engram":{"command":"node","args":["--eval","require('child_process').spawn('engram',['mcp','--tools=agent'],{stdio:'inherit'})"]}}}`+"\n"), 0o644); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -112,10 +127,9 @@ func TestRunInstallEngramForPiAndOpenCodeProvisionsBothMCPTargets(t *testing.T) 
 
 	assertFileContains(t, filepath.Join(home, ".pi", "agent", "settings.json"), "npm:pi-mcp-adapter")
 	assertFileContains(t, filepath.Join(home, ".pi", "npm", "package.json"), "pi-mcp-adapter")
-	assertFileContains(t, filepath.Join(home, ".pi", "agent", "mcp.json"), "directTools")
 	assertFileContains(t, filepath.Join(home, ".config", "opencode", "opencode.json"), "engram")
 
-	for _, want := range []string{"pi install npm:pi-mcp-adapter", "npm exec --yes --package gentle-engram -- pi-engram init"} {
+	for _, want := range []string{"pi install npm:pi-mcp-adapter", fmt.Sprintf("npm exec --yes --package gentle-engram@%s -- pi-engram init", versions.GentleEngram)} {
 		if !stringSliceContains(commands, want) {
 			t.Fatalf("commands missing %q; got %v", want, commands)
 		}
@@ -161,7 +175,7 @@ func TestPiAgentInstallRunsPackageCommandsWhenPiAlreadyInstalled(t *testing.T) {
 		"pi install npm:gentle-pi",
 		"pi install npm:gentle-engram",
 		"pi install npm:pi-mcp-adapter",
-		"npm exec --yes --package gentle-engram -- pi-engram init",
+		fmt.Sprintf("npm exec --yes --package gentle-engram@%s -- pi-engram init", versions.GentleEngram),
 		"pi install npm:pi-subagents",
 		"pi install npm:pi-intercom",
 		"pi install npm:@juicesharp/rpiv-ask-user-question",
@@ -571,7 +585,7 @@ func TestRunInstallLinuxAgentInstallResolvesGoInstallCommand(t *testing.T) {
 	commands := recorder.get()
 	foundNpmInstall := false
 	for _, cmd := range commands {
-		if strings.Contains(cmd, "sudo npm install -g opencode-ai") {
+		if strings.Contains(cmd, "sudo npm install -g --ignore-scripts opencode-ai@"+versions.OpenCode) {
 			foundNpmInstall = true
 			break
 		}
@@ -1497,9 +1511,14 @@ func TestRunInstallDryRunMatchesActualInstallOpenCodeSDDMulti(t *testing.T) {
 	for _, component := range dryResult.Resolved.OrderedComponents {
 		expectedPaths = append(expectedPaths, componentPaths(home, dryResult.Selection, adapters, component)...)
 	}
-	pluginPath := filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts")
-	if !containsPath(expectedPaths, pluginPath) {
-		t.Fatalf("dry-run expected paths missing multi-mode plugin %q\npaths=%v", pluginPath, expectedPaths)
+	pluginPaths := []string{
+		filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts"),
+		filepath.Join(home, ".config", "opencode", "plugins", "model-variants.ts"),
+	}
+	for _, pluginPath := range pluginPaths {
+		if !containsPath(expectedPaths, pluginPath) {
+			t.Fatalf("dry-run expected paths missing multi-mode plugin %q\npaths=%v", pluginPath, expectedPaths)
+		}
 	}
 
 	restoreHome := osUserHomeDir
@@ -1526,6 +1545,11 @@ func TestRunInstallDryRunMatchesActualInstallOpenCodeSDDMulti(t *testing.T) {
 	for _, path := range expectedPaths {
 		if _, statErr := os.Stat(path); statErr != nil {
 			t.Fatalf("expected dry-run path %q to exist after install: %v", path, statErr)
+		}
+	}
+	for _, pluginPath := range pluginPaths {
+		if _, statErr := os.Stat(pluginPath); statErr != nil {
+			t.Fatalf("expected OpenCode SDD plugin %q to exist after install: %v", pluginPath, statErr)
 		}
 	}
 }

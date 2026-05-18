@@ -16,6 +16,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/pipeline"
 	"github.com/gentleman-programming/gentle-ai/internal/planner"
+	"github.com/gentleman-programming/gentle-ai/internal/skillregistry"
 	"github.com/gentleman-programming/gentle-ai/internal/state"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
 	"github.com/gentleman-programming/gentle-ai/internal/tui"
@@ -58,6 +59,8 @@ func RunArgs(args []string, stdout io.Writer) error {
 		case "uninstall":
 			_, err := cli.RunUninstall(args[1:], stdout)
 			return err
+		case "skill-registry":
+			return runSkillRegistry(args[1:], stdout)
 		}
 	}
 
@@ -168,6 +171,63 @@ func RunArgs(args []string, stdout io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q — run 'gentle-ai help' for available commands", args[0])
 	}
+}
+
+func runSkillRegistry(args []string, stdout io.Writer) error {
+	if len(args) == 0 || args[0] != "refresh" {
+		return fmt.Errorf("usage: gentle-ai skill-registry refresh [--cwd <dir>] [--force] [--quiet] [--no-gitignore]")
+	}
+
+	cwd := ""
+	force := false
+	quiet := false
+	ensureGitignore := true
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--force", "-f":
+			force = true
+		case "--quiet", "-q":
+			quiet = true
+		case "--no-gitignore":
+			ensureGitignore = false
+		case "--cwd":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--cwd requires a value")
+			}
+			cwd = args[i+1]
+			i++
+		default:
+			return fmt.Errorf("unknown skill-registry argument %q", args[i])
+		}
+	}
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("resolve cwd: %w", err)
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home directory: %w", err)
+	}
+	if ensureGitignore {
+		if err := skillregistry.EnsureATLIgnored(cwd); err != nil {
+			return err
+		}
+	}
+	result, err := skillregistry.Regenerate(cwd, home, force)
+	if err != nil {
+		return err
+	}
+	if !quiet {
+		if result.Regenerated {
+			_, _ = fmt.Fprintf(stdout, "Skill registry refreshed (%d skills): %s\n", result.SkillCount, result.Registry)
+		} else {
+			_, _ = fmt.Fprintf(stdout, "Skill registry up to date (%s): %s\n", result.Reason, result.Registry)
+		}
+	}
+	return nil
 }
 
 func runUpdate(ctx context.Context, currentVersion string, profile system.PlatformProfile, stdout io.Writer) error {
@@ -321,7 +381,7 @@ func tuiUpgrade(profile system.PlatformProfile, homeDir string) tui.UpgradeFunc 
 // so that the "Configure Models" TUI flow persists its choices to disk.
 func tuiSync(homeDir string) tui.SyncFunc {
 	return func(overrides *model.SyncOverrides) (int, error) {
-		agentIDs := cli.DiscoverAgents(homeDir)
+		agentIDs := syncAgentIDs(homeDir, overrides)
 		selection := cli.BuildSyncSelection(cli.SyncFlags{}, agentIDs)
 
 		// Load persisted model assignments so a plain sync (no overrides)
@@ -364,6 +424,23 @@ func tuiUninstallWithProfiles(homeDir string) tui.UninstallWithProfilesFunc {
 		}
 		return cli.RunUninstallWithSelectionAndProfiles(homeDir, workspaceDir, agentIDs, componentIDs, profileNames, engramScope)
 	}
+}
+
+func syncAgentIDs(homeDir string, overrides *model.SyncOverrides) []model.AgentID {
+	if overrides == nil || len(overrides.TargetAgents) == 0 {
+		return cli.DiscoverAgents(homeDir)
+	}
+
+	seen := make(map[model.AgentID]bool, len(overrides.TargetAgents))
+	ids := make([]model.AgentID, 0, len(overrides.TargetAgents))
+	for _, id := range overrides.TargetAgents {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // applyOverrides merges non-nil fields from overrides into selection.
@@ -410,6 +487,11 @@ func loadPersistedAssignments(homeDir string, selection *model.Selection) {
 	if len(selection.ClaudeModelAssignments) == 0 && len(s.ClaudeModelAssignments) > 0 {
 		m := make(map[string]model.ClaudeModelAlias, len(s.ClaudeModelAssignments))
 		for k, v := range s.ClaudeModelAssignments {
+			// Claude Code controls the main session/orchestrator model itself.
+			// Keep persisted assignments scoped to Agent tool calls only.
+			if k == "orchestrator" {
+				continue
+			}
 			m[k] = model.ClaudeModelAlias(v)
 		}
 		selection.ClaudeModelAssignments = m
@@ -424,7 +506,7 @@ func loadPersistedAssignments(homeDir string, selection *model.Selection) {
 	if len(selection.ModelAssignments) == 0 && len(s.ModelAssignments) > 0 {
 		m := make(map[string]model.ModelAssignment, len(s.ModelAssignments))
 		for k, v := range s.ModelAssignments {
-			m[k] = model.ModelAssignment{ProviderID: v.ProviderID, ModelID: v.ModelID}
+			m[k] = model.ModelAssignment{ProviderID: v.ProviderID, ModelID: v.ModelID, Effort: v.Effort}
 		}
 		selection.ModelAssignments = m
 	}
@@ -462,6 +544,11 @@ func claudeAliasesToStrings(m map[string]model.ClaudeModelAlias) map[string]stri
 	}
 	out := make(map[string]string, len(m))
 	for k, v := range m {
+		// Claude Code owns the main session/orchestrator model; do not persist it
+		// as a Gentle AI model assignment.
+		if k == "orchestrator" {
+			continue
+		}
 		out[k] = string(v)
 	}
 	return out
@@ -475,7 +562,7 @@ func modelAssignmentsToState(m map[string]model.ModelAssignment) map[string]stat
 	}
 	out := make(map[string]state.ModelAssignmentState, len(m))
 	for k, v := range m {
-		out[k] = state.ModelAssignmentState{ProviderID: v.ProviderID, ModelID: v.ModelID}
+		out[k] = state.ModelAssignmentState{ProviderID: v.ProviderID, ModelID: v.ModelID, Effort: v.Effort}
 	}
 	return out
 }

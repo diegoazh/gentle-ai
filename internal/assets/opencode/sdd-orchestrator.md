@@ -28,6 +28,27 @@ Anti-patterns that always inflate context without need:
 - Running tests or external tools inline -> delegate
 - Reading files as preparation for edits, then editing -> delegate the whole thing together
 
+Delegation is not optional once complexity appears. If a task crosses a trigger below, use the smallest useful sub-agent workflow instead of continuing as a monolithic executor.
+
+#### Mandatory Delegation Triggers
+
+These are parent-orchestrator stop rules. Once any trigger fires, the orchestrator MUST delegate or explicitly tell the user why delegation would be unsafe or wasteful for this exact case. Do not pass these rules to child agents as permission to spawn more agents; children receive concrete role work and must not orchestrate.
+
+1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task.
+2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer or continue inline only if a fresh review will audit before completion.
+3. **PR rule**: before commit, push, or PR after code changes, run a fresh-context review unless the diff is trivial docs/text.
+4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run a fresh audit before continuing.
+5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate instead of silently continuing monolithically.
+6. **Fresh review rule**: use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents; use continuity/forked context only for implementation work that needs inherited state.
+
+#### Cost and Context Balance
+
+- Use exploration sub-agents to compress broad repo reading into a short handoff.
+- Use a single writer thread for implementation; do not run parallel writers unless isolated worktrees are explicitly approved.
+- Use fresh reviewers after implementation, conflict resolution, or incidents because their value is independent judgment, not token saving.
+- Avoid delegation for truly local one-file fixes, quick state checks, and already-understood mechanical edits.
+
+
 ## SDD Workflow (Spec-Driven Development)
 
 SDD is the structured planning layer for substantial changes.
@@ -154,26 +175,26 @@ Read the configured models from `opencode.json` at session start (or before firs
 
 ### Sub-Agent Launch Pattern
 
-ALL sub-agent launch prompts that involve reading, writing, or reviewing code MUST include pre-resolved compact rules from the skill registry. Follow the Skill Resolver Protocol (see `_shared/skill-resolver.md` in the skills directory).
+ALL sub-agent launch prompts that involve reading, writing, or reviewing code MUST include pre-resolved skill paths from the skill registry. Follow the Skill Resolver Protocol (see `_shared/skill-resolver.md` in the skills directory).
 
-The orchestrator resolves skills from the registry ONCE (at session start or first delegation), caches the compact rules, and injects matching rules into each sub-agent's prompt.
+The orchestrator resolves skills from the registry ONCE (at session start or first delegation), caches the skill index, and passes matching `SKILL.md` paths into each sub-agent's prompt.
 
 Orchestrator skill resolution (do once per session):
 1. `mem_search(query: "skill-registry", project: "{project}")` -> `mem_get_observation(id)` for full registry content
 2. Fallback: read `.atl/skill-registry.md` if engram is not available
-3. Cache the Compact Rules section and the User Skills trigger table
+3. Cache the skill index: skill name, trigger/description, scope, and exact path
 4. If no registry exists, warn the user and proceed without project-specific standards
 
 For each sub-agent launch:
 1. Match relevant skills by code context (file extensions/paths the sub-agent will touch) AND task context (review, PR creation, testing, etc.)
-2. Copy matching compact rule blocks into the sub-agent prompt as `## Project Standards (auto-resolved)`
-3. Inject them BEFORE the task-specific instructions
+2. Copy matching `SKILL.md` paths into the sub-agent prompt as `## Skills to load before work`
+3. Instruct the sub-agent to read those exact files BEFORE task-specific work
 
 ### Skill Resolution Feedback
 
 After every delegation that returns a result, check the `skill_resolution` field:
-- `injected` -> all good
-- `fallback-registry`, `fallback-path`, or `none` -> skill cache was lost; re-read the registry immediately and inject compact rules in subsequent delegations
+- `paths-injected` -> all good; exact skill paths were passed and loaded
+- `fallback-registry`, `fallback-path`, or `none` -> skill cache was lost; re-read the registry immediately and pass skill paths in subsequent delegations
 
 ### Sub-Agent Context Protocol
 

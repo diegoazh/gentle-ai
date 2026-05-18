@@ -167,9 +167,8 @@ func TestInjectClaudeCustomModelAssignments(t *testing.T) {
 	home := t.TempDir()
 
 	opts := InjectOptions{ClaudeModelAssignments: map[string]model.ClaudeModelAlias{
-		"orchestrator": model.ClaudeModelSonnet,
-		"sdd-design":   model.ClaudeModelSonnet,
-		"default":      model.ClaudeModelHaiku,
+		"sdd-design": model.ClaudeModelSonnet,
+		"default":    model.ClaudeModelHaiku,
 	}}
 
 	result, err := Inject(home, claudeAdapter(), "", opts)
@@ -186,10 +185,13 @@ func TestInjectClaudeCustomModelAssignments(t *testing.T) {
 	}
 
 	text := string(content)
+	if strings.Contains(text, "| orchestrator |") {
+		t.Fatal("CLAUDE.md should not expose orchestrator as a configurable model row")
+	}
 	for _, want := range []string{
-		"| orchestrator | sonnet | Coordinates, makes decisions |",
 		"| sdd-design | sonnet | Architecture decisions |",
 		"| default | haiku | Non-SDD general delegation |",
+		"Gentle AI does not configure the main orchestrator model",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("CLAUDE.md missing custom table row %q", want)
@@ -202,13 +204,21 @@ func TestInjectClaudeCustomModelAssignments(t *testing.T) {
 	if !strings.Contains(text, "<!-- /gentle-ai:sdd-model-assignments -->") {
 		t.Fatal("CLAUDE.md missing model assignment close marker")
 	}
+	for _, want := range []string{
+		"Every Agent tool call MUST include `model`",
+		"for general/non-SDD delegation use `default`",
+		"If `model` is absent, do not send the Agent call",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("CLAUDE.md missing mandatory model gate text %q", want)
+		}
+	}
 }
 
 func TestInjectClaudeCustomModelAssignmentsIsIdempotent(t *testing.T) {
 	home := t.TempDir()
 	opts := InjectOptions{ClaudeModelAssignments: map[string]model.ClaudeModelAlias{
-		"orchestrator": model.ClaudeModelSonnet,
-		"sdd-design":   model.ClaudeModelSonnet,
+		"sdd-design": model.ClaudeModelSonnet,
 	}}
 
 	first, err := Inject(home, claudeAdapter(), "", opts)
@@ -843,6 +853,88 @@ func TestInjectKimiWritesNativeAgentFilesAndGlobalSkills(t *testing.T) {
 	}
 }
 
+func TestInjectKimiKiroWindsurfAntigravityPreserveNativeChainStrategyWording(t *testing.T) {
+	tests := []struct {
+		name       string
+		agentID    model.AgentID
+		promptPath func(home string, adapter agents.Adapter) string
+		required   []string
+		forbidden  []string
+	}{
+		{
+			name:    "kimi",
+			agentID: model.AgentKimi,
+			promptPath: func(home string, _ agents.Adapter) string {
+				return filepath.Join(home, ".kimi", "sdd-orchestrator.md")
+			},
+			required: []string{"### Chain Strategy", "`stacked-to-main`", "`feature-branch-chain`", "delivery_strategy", "chain_strategy", "/skill:sdd-*", "multiagent:Task", "custom-agent prompt"},
+			forbidden: []string{"OpenCode's background-agent plugin", "plugin-backed persisted background delegation"},
+		},
+		{
+			name:    "kiro",
+			agentID: model.AgentKiroIDE,
+			promptPath: func(home string, adapter agents.Adapter) string {
+				return adapter.SystemPromptFile(home)
+			},
+			required: []string{"### Chain Strategy", "`stacked-to-main`", "`feature-branch-chain`", "delivery_strategy", "chain_strategy", "Kiro phase context", "native Kiro subagent context"},
+			forbidden: []string{"OpenCode's background-agent plugin", "plugin-backed persisted background delegation"},
+		},
+		{
+			name:    "windsurf",
+			agentID: model.AgentWindsurf,
+			promptPath: func(home string, adapter agents.Adapter) string {
+				return adapter.SystemPromptFile(home)
+			},
+			required: []string{"### Chain Strategy", "`stacked-to-main`", "`feature-branch-chain`", "delivery_strategy", "chain_strategy", "inline phase context", "There are no sub-agents"},
+			forbidden: []string{"OpenCode's background-agent plugin", "plugin-backed persisted background delegation", "custom sub-agent prompts"},
+		},
+		{
+			name:    "antigravity",
+			agentID: model.AgentAntigravity,
+			promptPath: func(home string, adapter agents.Adapter) string {
+				return adapter.SystemPromptFile(home)
+			},
+			required: []string{"### Chain Strategy", "`stacked-to-main`", "`feature-branch-chain`", "delivery_strategy", "chain_strategy", "inline phase context", "Phase Execution Protocol"},
+			forbidden: []string{"OpenCode's background-agent plugin", "plugin-backed persisted background delegation", "custom sub-agent prompts"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			adapter, err := agents.NewAdapter(tt.agentID)
+			if err != nil {
+				t.Fatalf("NewAdapter(%s) error = %v", tt.agentID, err)
+			}
+
+			result, injectErr := Inject(home, adapter, "")
+			if injectErr != nil {
+				t.Fatalf("Inject(%s) error = %v", tt.agentID, injectErr)
+			}
+			if !result.Changed {
+				t.Fatalf("Inject(%s) changed = false", tt.agentID)
+			}
+
+			content, readErr := os.ReadFile(tt.promptPath(home, adapter))
+			if readErr != nil {
+				t.Fatalf("ReadFile(%s prompt) error = %v", tt.name, readErr)
+			}
+			text := string(content)
+
+			for _, required := range tt.required {
+				if !strings.Contains(text, required) {
+					t.Fatalf("%s generated prompt missing %q", tt.name, required)
+				}
+			}
+			for _, forbidden := range tt.forbidden {
+				if strings.Contains(text, forbidden) {
+					t.Fatalf("%s generated prompt contains forbidden wording %q", tt.name, forbidden)
+				}
+			}
+		})
+	}
+}
+
 func TestInjectQwenCodeWritesSDDOrchestratorAndSkills(t *testing.T) {
 	home := t.TempDir()
 
@@ -997,8 +1089,8 @@ func TestInjectFileAppendMigratesLegacyHeading(t *testing.T) {
 	if strings.Count(text, "## Agent Teams Orchestrator") != 1 {
 		t.Fatal("agent teams heading duplicated after migration")
 	}
-	if !strings.Contains(text, "## Project Standards (auto-resolved)") {
-		t.Fatal("SDD orchestrator was not refreshed to current compact-rules format")
+	if !strings.Contains(text, "## Skills to load before work") {
+		t.Fatal("SDD orchestrator was not refreshed to current skill-path loading format")
 	}
 }
 
@@ -1052,8 +1144,8 @@ func TestInjectFileAppendMigratesFullLegacyOrchestratorBlock(t *testing.T) {
 	if !strings.Contains(text, "`skill_resolution`") {
 		t.Fatal("result contract was not refreshed to current format")
 	}
-	if !strings.Contains(text, "## Project Standards (auto-resolved)") {
-		t.Fatal("current compact-rules launch pattern missing after migration")
+	if !strings.Contains(text, "## Skills to load before work") {
+		t.Fatal("current skill-path launch pattern missing after migration")
 	}
 	if strings.Count(text, "<!-- gentle-ai:engram-protocol -->") != 1 {
 		t.Fatal("engram protocol marker should be preserved exactly once")
@@ -2891,6 +2983,146 @@ func TestInjectModelAssignmentsFunction(t *testing.T) {
 	}
 }
 
+// TestInjectModelAssignments_ReasoningEffortInjected verifies that when an
+// assignment has a non-empty Effort, the "variant" key is written into
+// the agent map alongside "model".
+func TestInjectModelAssignments_VariantInjected(t *testing.T) {
+	overlayJSON := []byte(`{
+  "agent": {
+    "sdd-apply": {"mode": "subagent", "prompt": "test"}
+  }
+}`)
+
+	assignments := map[string]model.ModelAssignment{
+		"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-opus-4", Effort: "medium"},
+	}
+
+	result, err := injectModelAssignments(overlayJSON, assignments, "", nil)
+	if err != nil {
+		t.Fatalf("injectModelAssignments() error = %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("Unmarshal result error = %v", err)
+	}
+
+	agents := parsed["agent"].(map[string]any)
+	applyAgent := agents["sdd-apply"].(map[string]any)
+	if re, _ := applyAgent["variant"].(string); re != "medium" {
+		t.Errorf("variant = %q, want %q", re, "medium")
+	}
+}
+
+// TestInjectModelAssignments_EmptyEffortSetsEmptyVariant verifies that when
+// Effort is empty, the "variant" key is set to "" so the deep merge overwrites
+// any pre-existing variant in the user's config.
+func TestInjectModelAssignments_EmptyEffortSetsEmptyVariant(t *testing.T) {
+	overlayJSON := []byte(`{
+  "agent": {
+    "sdd-apply": {"mode": "subagent", "prompt": "test"}
+  }
+}`)
+
+	assignments := map[string]model.ModelAssignment{
+		"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: ""},
+	}
+
+	result, err := injectModelAssignments(overlayJSON, assignments, "", nil)
+	if err != nil {
+		t.Fatalf("injectModelAssignments() error = %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("Unmarshal result error = %v", err)
+	}
+
+	agents := parsed["agent"].(map[string]any)
+	applyAgent := agents["sdd-apply"].(map[string]any)
+	v, hasKey := applyAgent["variant"].(string)
+	if !hasKey {
+		t.Fatal("variant key must be present (as empty string) to overwrite base during merge")
+	}
+	if v != "" {
+		t.Errorf("variant = %q, want empty string", v)
+	}
+}
+
+// TestInjectModelAssignments_StaleVariantOverwritten verifies that when switching
+// from a reasoning model to a non-reasoning model (Effort=""), a pre-existing
+// "variant" key in the overlay is overwritten with "".
+func TestInjectModelAssignments_StaleVariantOverwritten(t *testing.T) {
+	overlayJSON := []byte(`{
+  "agent": {
+    "sdd-apply": {"mode": "subagent", "prompt": "test", "variant": "high"}
+  }
+}`)
+
+	assignments := map[string]model.ModelAssignment{
+		"sdd-apply": {ProviderID: "openai", ModelID: "gpt-4o", Effort: ""},
+	}
+
+	result, err := injectModelAssignments(overlayJSON, assignments, "", nil)
+	if err != nil {
+		t.Fatalf("injectModelAssignments() error = %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("Unmarshal result error = %v", err)
+	}
+
+	agents := parsed["agent"].(map[string]any)
+	applyAgent := agents["sdd-apply"].(map[string]any)
+	v, _ := applyAgent["variant"].(string)
+	if v != "" {
+		t.Errorf("variant = %q, want empty string (should overwrite stale 'high')", v)
+	}
+}
+
+// TestInjectModelAssignments_RootModelFallbackClearsVariant verifies that
+// case 3 (rootModelID fallback — no TUI assignment, agent absent from user
+// config, root model set) writes variant:"" alongside the model. Mirrors the
+// case 1 contract so case 3 cannot leak a stale variant from the overlay
+// through to the user's settings file. See PR #440 review.
+func TestInjectModelAssignments_RootModelFallbackClearsVariant(t *testing.T) {
+	// The overlay carries a stale variant for sdd-apply but the user has no
+	// matching agent key, so case 2 cannot fire — case 3 must take over and
+	// clear the variant.
+	overlayJSON := []byte(`{
+  "agent": {
+    "sdd-apply": {"mode": "subagent", "prompt": "test", "variant": "high"}
+  }
+}`)
+
+	// No TUI assignment for sdd-apply, no existing agent key in user config,
+	// rootModelID is set → case 3 fires.
+	result, err := injectModelAssignments(overlayJSON, nil, "anthropic/claude-sonnet-4", map[string]bool{})
+	if err != nil {
+		t.Fatalf("injectModelAssignments() error = %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("Unmarshal result error = %v", err)
+	}
+
+	agents := parsed["agent"].(map[string]any)
+	applyAgent := agents["sdd-apply"].(map[string]any)
+
+	if m, _ := applyAgent["model"].(string); m != "anthropic/claude-sonnet-4" {
+		t.Errorf("model = %q, want rootModelID", m)
+	}
+	v, hasKey := applyAgent["variant"].(string)
+	if !hasKey {
+		t.Fatal("variant key must be present (set to \"\") in case 3 — symmetric with case 1")
+	}
+	if v != "" {
+		t.Errorf("variant = %q, want empty string (case 3 must clear stale variant)", v)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Windsurf workflow injection tests
 // ---------------------------------------------------------------------------
@@ -4405,5 +4637,115 @@ func TestInjectClaudeSubAgentsScopedTools(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEnsureClaudeSkillRegistryHookAppendsIdempotently(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initial := `{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "echo keep"}
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {"type": "command", "command": "echo existing"}
+        ]
+      }
+    ]
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeSkillRegistryHook(settingsPath)
+	if err != nil {
+		t.Fatalf("ensureClaudeSkillRegistryHook() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("first call changed = false, want true")
+	}
+	changed, err = ensureClaudeSkillRegistryHook(settingsPath)
+	if err != nil {
+		t.Fatalf("second ensureClaudeSkillRegistryHook() error = %v", err)
+	}
+	if changed {
+		t.Fatal("second call changed = true, want false")
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Count(text, "gentle-ai skill-registry refresh") != 1 {
+		t.Fatalf("hook command count mismatch:\n%s", text)
+	}
+	if !strings.Contains(text, "echo keep") || !strings.Contains(text, "echo existing") {
+		t.Fatalf("existing hooks not preserved:\n%s", text)
+	}
+}
+
+func TestEnsureClaudeSkillRegistryHookRejectsMalformedSettings(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`{"permissions":`)
+	if err := os.WriteFile(settingsPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := ensureClaudeSkillRegistryHook(settingsPath)
+	if err == nil {
+		t.Fatal("ensureClaudeSkillRegistryHook() error = nil, want parse error")
+	}
+	if changed {
+		t.Fatal("changed = true, want false")
+	}
+	after, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(original) {
+		t.Fatalf("malformed settings were modified: %q", after)
+	}
+}
+
+func TestEnsureClaudeSkillRegistryHookRejectsUnexpectedHookSchema(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`{"hooks":{"UserPromptSubmit":{"bad":true}}}`)
+	if err := os.WriteFile(settingsPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := ensureClaudeSkillRegistryHook(settingsPath)
+	if err == nil {
+		t.Fatal("ensureClaudeSkillRegistryHook() error = nil, want schema error")
+	}
+	if changed {
+		t.Fatal("changed = true, want false")
+	}
+	after, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(original) {
+		t.Fatalf("settings were modified: %q", after)
 	}
 }

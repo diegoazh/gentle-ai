@@ -28,6 +28,27 @@ Anti-patterns — these ALWAYS inflate context without need:
 - Running tests or builds inline → delegate
 - Reading files as preparation for edits, then editing → delegate the whole thing together
 
+Delegation is not optional once complexity appears. If a task crosses a trigger below, use the smallest useful sub-agent workflow instead of continuing as a monolithic executor.
+
+#### Mandatory Delegation Triggers
+
+These are parent-orchestrator stop rules. Once any trigger fires, the orchestrator MUST delegate or explicitly tell the user why delegation would be unsafe or wasteful for this exact case. Do not pass these rules to child agents as permission to spawn more agents; children receive concrete role work and must not orchestrate.
+
+1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task.
+2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer or continue inline only if a fresh review will audit before completion.
+3. **PR rule**: before commit, push, or PR after code changes, run a fresh-context review unless the diff is trivial docs/text.
+4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run a fresh audit before continuing.
+5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate instead of silently continuing monolithically.
+6. **Fresh review rule**: use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents; use continuity/forked context only for implementation work that needs inherited state.
+
+#### Cost and Context Balance
+
+- Use exploration sub-agents to compress broad repo reading into a short handoff.
+- Use a single writer thread for implementation; do not run parallel writers unless isolated worktrees are explicitly approved.
+- Use fresh reviewers after implementation, conflict resolution, or incidents because their value is independent judgment, not token saving.
+- Avoid delegation for truly local one-file fixes, quick state checks, and already-understood mechanical edits.
+
+
 ## SDD Workflow (Spec-Driven Development)
 
 SDD is the structured planning layer for substantial changes.
@@ -95,6 +116,15 @@ Cache the artifact store choice for the session. Pass it as `artifact_store.mode
 
 On the first `/sdd-new`, `/sdd-ff`, or `/sdd-continue` (or an equivalent natural-language request) in a session, ask once for and cache delivery strategy: `ask-on-risk` (default), `auto-chain`, `single-pr`, or `exception-ok`. Pass it as `delivery_strategy` to `sdd-tasks` and `sdd-apply` prompts.
 
+### Chain Strategy
+
+When `delivery_strategy` results in chained PRs (either by user choice via `ask-on-risk` or automatically via `auto-chain`), ask the user which chain strategy to use:
+
+- **`stacked-to-main`**: Each PR merges to main in order. Fast iteration, fix on the go. Best for speed-first teams and independent slices.
+- **`feature-branch-chain`**: The feature/tracker branch accumulates final integration; PR #1 targets the tracker branch, later child PRs target the immediate previous PR branch so review diffs stay focused. Only the tracker merges to main. Best for rollback control and coordinated releases.
+
+Cache the chain strategy for the session. Pass it as `chain_strategy` to `sdd-tasks` and `sdd-apply` Kimi custom-agent prompt context alongside `delivery_strategy`. Do not ask again unless the user changes scope.
+
 ### Dependency Graph
 ```
 proposal -> specs --> tasks -> apply -> verify -> archive
@@ -112,29 +142,31 @@ After `sdd-tasks` completes and before launching `sdd-apply`, inspect `Review Wo
 
 If it says `Chained PRs recommended: Yes`, `400-line budget risk: High`, estimated changed lines exceed 400, or `Decision needed before apply: Yes`, apply cached `delivery_strategy`:
 
-- **`ask-on-risk`**: STOP and ask chained/stacked PRs vs maintainer-approved `size:exception`.
-- **`auto-chain`**: Do not ask. Tell `sdd-apply` to implement only the next autonomous chained/stacked PR slice using work-unit commits.
+- **`ask-on-risk`**: STOP and ask chained/stacked PRs vs maintainer-approved `size:exception`. If the user chooses chained PRs and `chain_strategy` is not yet cached, also ask which chain strategy to use (`stacked-to-main` or `feature-branch-chain`).
+- **`auto-chain`**: Do not ask about splitting. If `chain_strategy` is not yet cached, ask which chain strategy to use. Then tell `/skill:sdd-apply` via `multiagent:Task` to implement only the next autonomous chained/stacked PR slice using work-unit commits, clear start/finish boundaries, verification, and rollback.
 - **`single-pr`**: STOP and require/record `size:exception` before apply.
 - **`exception-ok`**: Continue, but tell `sdd-apply` this run uses `size:exception`.
 
-Automatic mode does not override this guard. Always pass the resolved delivery strategy to `sdd-apply`.
+Automatic mode does not override this guard. Always pass the resolved `delivery_strategy` and `chain_strategy` to `sdd-apply` Kimi custom-agent prompt context.
+
+When launching `/skill:sdd-apply` through `multiagent:Task`, always include the resolved `delivery_strategy`, `chain_strategy`, and any chosen PR boundary/exception in the custom-agent prompt.
 
 ### Sub-Agent Launch Pattern
 
-ALL Kimi sub-agent launches that involve reading, writing, or reviewing code MUST include pre-resolved **compact rules** from the skill registry. Follow the **Skill Resolver Protocol** in `~/.config/agents/skills/_shared/skill-resolver.md`.
+ALL Kimi sub-agent launches that involve reading, writing, or reviewing code MUST include pre-resolved **skill paths** from the skill registry. Follow the **Skill Resolver Protocol** in `~/.config/agents/skills/_shared/skill-resolver.md`.
 
-The orchestrator resolves skills from the registry ONCE (at session start or first delegation), caches the compact rules, and injects matching rules into each sub-agent prompt.
+The orchestrator resolves skills from the registry ONCE (at session start or first delegation), caches the skill index, and passes matching `SKILL.md` paths into each sub-agent prompt.
 
 For each sub-agent launch:
 1. Match relevant skills by **code context** and **task context**
-2. Copy matching compact rule blocks into the sub-agent prompt as `## Project Standards (auto-resolved)`
-3. Inject BEFORE the sub-agent's phase-specific instructions
+2. Copy matching `SKILL.md` paths into the sub-agent prompt as `## Skills to load before work`
+3. Instruct the sub-agent to read those exact files BEFORE phase-specific work
 
 ### Skill Resolution Feedback
 
 After every delegation that returns a result, check the `skill_resolution` field:
-- `injected` → all good
-- `fallback-registry`, `fallback-path`, or `none` → skill cache was lost. Re-read the registry immediately and inject compact rules in all subsequent delegations.
+- `paths-injected` → all good, exact skill paths were passed and loaded
+- `fallback-registry`, `fallback-path`, or `none` → skill cache was lost. Re-read the registry immediately and pass skill paths in all subsequent delegations.
 
 ### Sub-Agent Context Protocol
 

@@ -12,6 +12,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
 	componentuninstall "github.com/gentleman-programming/gentle-ai/internal/components/uninstall"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/internal/opencode"
 	"github.com/gentleman-programming/gentle-ai/internal/pipeline"
 	"github.com/gentleman-programming/gentle-ai/internal/planner"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
@@ -28,6 +29,167 @@ func TestNavigationWelcomeToDetection(t *testing.T) {
 
 	if state.Screen != ScreenDetection {
 		t.Fatalf("screen = %v, want %v", state.Screen, ScreenDetection)
+	}
+}
+
+func TestSanitizeKnownModelEfforts_ValidKnownEffortPreserved(t *testing.T) {
+	assignments := map[string]model.ModelAssignment{
+		"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-opus-4", Effort: "high"},
+	}
+	sddModels := map[string][]opencode.Model{
+		"anthropic": {{ID: "claude-opus-4", Variants: []string{"low", "medium", "high"}}},
+	}
+
+	got := sanitizeKnownModelEfforts(assignments, sddModels)
+
+	if got["sdd-apply"].Effort != "high" {
+		t.Fatalf("Effort = %q, want high", got["sdd-apply"].Effort)
+	}
+}
+
+func TestSanitizeKnownModelEfforts_InvalidKnownEffortCleared(t *testing.T) {
+	assignments := map[string]model.ModelAssignment{
+		"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-opus-4", Effort: "high"},
+	}
+	sddModels := map[string][]opencode.Model{
+		"anthropic": {{ID: "claude-opus-4", Variants: []string{"low", "medium"}}},
+	}
+
+	got := sanitizeKnownModelEfforts(assignments, sddModels)
+
+	if got["sdd-apply"].Effort != "" {
+		t.Fatalf("Effort = %q, want empty for invalid known effort", got["sdd-apply"].Effort)
+	}
+}
+
+func TestSanitizeKnownModelEfforts_KnownNonReasoningModelClearsEffort(t *testing.T) {
+	assignments := map[string]model.ModelAssignment{
+		"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
+	}
+	sddModels := map[string][]opencode.Model{
+		"anthropic": {{ID: "claude-sonnet-4", Reasoning: false}},
+	}
+
+	got := sanitizeKnownModelEfforts(assignments, sddModels)
+
+	if got["sdd-apply"].Effort != "" {
+		t.Fatalf("Effort = %q, want empty for known non-reasoning model", got["sdd-apply"].Effort)
+	}
+}
+
+func TestSanitizeKnownModelEfforts_UnknownModelDataPreservesStoredEffort(t *testing.T) {
+	tests := []struct {
+		name      string
+		sddModels map[string][]opencode.Model
+	}{
+		{
+			name:      "provider missing",
+			sddModels: map[string][]opencode.Model{},
+		},
+		{
+			name:      "model missing",
+			sddModels: map[string][]opencode.Model{"anthropic": {{ID: "other-model", Variants: []string{"low"}}}},
+		},
+		{
+			name:      "nil variants",
+			sddModels: map[string][]opencode.Model{"anthropic": {{ID: "claude-opus-4", Reasoning: true}}},
+		},
+		{
+			name:      "empty variants",
+			sddModels: map[string][]opencode.Model{"anthropic": {{ID: "claude-opus-4", Reasoning: true, Variants: []string{}}}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assignments := map[string]model.ModelAssignment{
+				"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-opus-4", Effort: "high"},
+			}
+
+			got := sanitizeKnownModelEfforts(assignments, tt.sddModels)
+
+			if got["sdd-apply"].Effort != "high" {
+				t.Fatalf("Effort = %q, want high when variants are unknown", got["sdd-apply"].Effort)
+			}
+		})
+	}
+}
+
+func TestProfileCreateContinueSanitizesStaleEffort(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenProfileCreate
+	m.ProfileCreateStep = 1
+	m.ProfileDraft = model.Profile{Name: "work"}
+	m.Cursor = len(screens.ModelPickerRows())
+	m.ModelPicker = screens.ModelPickerState{
+		SDDModels: map[string][]opencode.Model{
+			"anthropic": {{ID: "claude-sonnet-4", Variants: []string{"low", "medium"}}},
+		},
+	}
+	m.Selection.ModelAssignments = map[string]model.ModelAssignment{
+		screens.SDDOrchestratorPhase: {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
+		"sdd-apply":                  {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	if got := state.ProfileDraft.OrchestratorModel.Effort; got != "" {
+		t.Fatalf("orchestrator Effort = %q, want empty for stale known effort", got)
+	}
+	if got := state.ProfileDraft.PhaseAssignments["sdd-apply"].Effort; got != "" {
+		t.Fatalf("sdd-apply Effort = %q, want empty for stale known effort", got)
+	}
+}
+
+func TestProfileEditContinueSanitizesStaleEffort(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenProfileCreate
+	m.ProfileCreateStep = 1
+	m.ProfileEditMode = true
+	m.ProfileDraft = model.Profile{Name: "work"}
+	m.Cursor = len(screens.ModelPickerRows())
+	m.ModelPicker = screens.ModelPickerState{
+		SDDModels: map[string][]opencode.Model{
+			"anthropic": {{ID: "claude-sonnet-4", Variants: []string{"low", "medium"}}},
+		},
+	}
+	m.Selection.ModelAssignments = map[string]model.ModelAssignment{
+		screens.SDDOrchestratorPhase: {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
+		"sdd-apply":                  {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	if got := state.ProfileDraft.OrchestratorModel.Effort; got != "" {
+		t.Fatalf("orchestrator Effort = %q, want empty for stale known effort", got)
+	}
+	if got := state.ProfileDraft.PhaseAssignments["sdd-apply"].Effort; got != "" {
+		t.Fatalf("sdd-apply Effort = %q, want empty for stale known effort", got)
+	}
+}
+
+func TestProfileCreateContinuePreservesEffortWhenVariantDataUnknown(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenProfileCreate
+	m.ProfileCreateStep = 1
+	m.ProfileDraft = model.Profile{Name: "work"}
+	m.Cursor = len(screens.ModelPickerRows())
+	m.ModelPicker = screens.ModelPickerState{SDDModels: map[string][]opencode.Model{}}
+	m.Selection.ModelAssignments = map[string]model.ModelAssignment{
+		screens.SDDOrchestratorPhase: {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
+		"sdd-apply":                  {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	if got := state.ProfileDraft.OrchestratorModel.Effort; got != "high" {
+		t.Fatalf("orchestrator Effort = %q, want high when variant data is unknown", got)
+	}
+	if got := state.ProfileDraft.PhaseAssignments["sdd-apply"].Effort; got != "high" {
+		t.Fatalf("sdd-apply Effort = %q, want high when variant data is unknown", got)
 	}
 }
 
@@ -576,8 +738,8 @@ func TestClaudeModelPickerBalancedSelectionStoresAssignments(t *testing.T) {
 	if state.Screen != ScreenStrictTDD {
 		t.Fatalf("screen = %v, want %v (ClaudeCode + SDD goes to StrictTDD first)", state.Screen, ScreenStrictTDD)
 	}
-	if got := state.Selection.ClaudeModelAssignments["orchestrator"]; got != model.ClaudeModelOpus {
-		t.Fatalf("orchestrator = %q, want %q", got, model.ClaudeModelOpus)
+	if _, exists := state.Selection.ClaudeModelAssignments["orchestrator"]; exists {
+		t.Fatalf("orchestrator should not be configurable by Claude model picker: %v", state.Selection.ClaudeModelAssignments)
 	}
 	if got := state.Selection.ClaudeModelAssignments["default"]; got != model.ClaudeModelSonnet {
 		t.Fatalf("default = %q, want %q", got, model.ClaudeModelSonnet)
@@ -2077,19 +2239,46 @@ func TestModelConfig_ClaudePickerTriggersSyncScreen(t *testing.T) {
 	if state.PendingSyncOverrides == nil {
 		t.Fatalf("step2: PendingSyncOverrides should be non-nil after Claude model selection")
 	}
+	if got := state.PendingSyncOverrides.TargetAgents; len(got) != 1 || got[0] != model.AgentClaudeCode {
+		t.Fatalf("step2: TargetAgents = %v, want [%s]", got, model.AgentClaudeCode)
+	}
 	if len(state.PendingSyncOverrides.ClaudeModelAssignments) == 0 {
 		t.Fatalf("step2: PendingSyncOverrides.ClaudeModelAssignments should be non-empty, got: %v",
 			state.PendingSyncOverrides.ClaudeModelAssignments)
 	}
-	// Balanced preset: orchestrator → opus, sdd-archive → haiku.
-	if got := state.PendingSyncOverrides.ClaudeModelAssignments["orchestrator"]; got != model.ClaudeModelOpus {
-		t.Errorf("step2: ClaudeModelAssignments[orchestrator] = %q, want %q", got, model.ClaudeModelOpus)
+	// Balanced preset configures sub-agents/default only; Claude controls the main orchestrator model.
+	if _, exists := state.PendingSyncOverrides.ClaudeModelAssignments["orchestrator"]; exists {
+		t.Errorf("step2: orchestrator should not be configurable by Claude model picker: %v", state.PendingSyncOverrides.ClaudeModelAssignments)
 	}
 }
 
 // TestModelConfig_OpenCodePickerContinueTriggersSyncScreen verifies that pressing
 // "Continue" from ScreenModelPicker while in ModelConfigMode navigates to ScreenSync
 // and populates PendingSyncOverrides with ModelAssignments and SDDMode=multi.
+func TestModelConfig_ProfileSaveTargetsOpenCode(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenProfileCreate
+	m.ProfileCreateStep = 2
+	m.Cursor = 0
+	m.ProfileDraft = model.Profile{Name: "free"}
+
+	updated, _ := m.confirmProfileCreate()
+	state := updated.(Model)
+
+	if state.Screen != ScreenSync {
+		t.Fatalf("screen = %v, want ScreenSync", state.Screen)
+	}
+	if state.PendingSyncOverrides == nil {
+		t.Fatalf("PendingSyncOverrides should be non-nil after profile Save & Sync")
+	}
+	if got := state.PendingSyncOverrides.TargetAgents; len(got) != 1 || got[0] != model.AgentOpenCode {
+		t.Fatalf("TargetAgents = %v, want [%s]", got, model.AgentOpenCode)
+	}
+	if got := state.PendingSyncOverrides.Profiles; len(got) != 1 || got[0].Name != "free" {
+		t.Fatalf("Profiles = %v, want profile named free", got)
+	}
+}
+
 func TestModelConfig_OpenCodePickerContinueTriggersSyncScreen(t *testing.T) {
 	m := NewModel(system.DetectionResult{}, "dev")
 	m.Screen = ScreenModelPicker
@@ -2098,11 +2287,14 @@ func TestModelConfig_OpenCodePickerContinueTriggersSyncScreen(t *testing.T) {
 	// Populate AvailableIDs so ModelPicker shows rows (not just "Back").
 	m.ModelPicker = screens.ModelPickerState{
 		AvailableIDs: []string{"anthropic"},
+		SDDModels: map[string][]opencode.Model{
+			"anthropic": {{ID: "claude-sonnet-4", Variants: []string{"low", "medium"}}},
+		},
 	}
 
 	// Set some model assignments so we can verify they're captured.
 	m.Selection.ModelAssignments = map[string]model.ModelAssignment{
-		"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-sonnet-4"},
+		"sdd-apply": {ProviderID: "anthropic", ModelID: "claude-sonnet-4", Effort: "high"},
 	}
 
 	// cursor == len(ModelPickerRows()) is the "Continue" option.
@@ -2121,6 +2313,9 @@ func TestModelConfig_OpenCodePickerContinueTriggersSyncScreen(t *testing.T) {
 	if state.PendingSyncOverrides == nil {
 		t.Fatalf("PendingSyncOverrides should be non-nil after OpenCode model selection")
 	}
+	if got := state.PendingSyncOverrides.TargetAgents; len(got) != 1 || got[0] != model.AgentOpenCode {
+		t.Fatalf("TargetAgents = %v, want [%s]", got, model.AgentOpenCode)
+	}
 	if got := state.PendingSyncOverrides.SDDMode; got != model.SDDModeMulti {
 		t.Errorf("PendingSyncOverrides.SDDMode = %q, want %q", got, model.SDDModeMulti)
 	}
@@ -2130,6 +2325,9 @@ func TestModelConfig_OpenCodePickerContinueTriggersSyncScreen(t *testing.T) {
 	}
 	if got := state.PendingSyncOverrides.ModelAssignments["sdd-apply"]; got.ProviderID != "anthropic" {
 		t.Errorf("ModelAssignments[sdd-apply].ProviderID = %q, want %q", got.ProviderID, "anthropic")
+	}
+	if got := state.PendingSyncOverrides.ModelAssignments["sdd-apply"]; got.Effort != "" {
+		t.Errorf("ModelAssignments[sdd-apply].Effort = %q, want empty for invalid known effort", got.Effort)
 	}
 }
 
@@ -2142,8 +2340,7 @@ func TestModelConfig_SyncPassesOverridesToSyncFn(t *testing.T) {
 
 	testOverrides := &model.SyncOverrides{
 		ClaudeModelAssignments: map[string]model.ClaudeModelAlias{
-			"orchestrator": model.ClaudeModelOpus,
-			"default":      model.ClaudeModelSonnet,
+			"default": model.ClaudeModelSonnet,
 		},
 	}
 	m.PendingSyncOverrides = testOverrides
@@ -2185,8 +2382,8 @@ func TestModelConfig_SyncPassesOverridesToSyncFn(t *testing.T) {
 	if capturedOverrides == nil {
 		t.Fatalf("SyncFn was not called with overrides — capturedOverrides is nil")
 	}
-	if got := capturedOverrides.ClaudeModelAssignments["orchestrator"]; got != model.ClaudeModelOpus {
-		t.Errorf("captured ClaudeModelAssignments[orchestrator] = %q, want %q", got, model.ClaudeModelOpus)
+	if got := capturedOverrides.ClaudeModelAssignments["default"]; got != model.ClaudeModelSonnet {
+		t.Errorf("captured ClaudeModelAssignments[default] = %q, want %q", got, model.ClaudeModelSonnet)
 	}
 
 	// Feed SyncDoneMsg back through Update to verify end-to-end state cleanup.

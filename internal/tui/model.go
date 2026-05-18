@@ -51,6 +51,58 @@ var readProfilesFn = func(settingsPath string) ([]model.Profile, error) {
 	return sdd.DetectProfiles(settingsPath)
 }
 
+func sanitizeKnownModelEfforts(assignments map[string]model.ModelAssignment, sddModels map[string][]opencode.Model) map[string]model.ModelAssignment {
+	if assignments == nil {
+		return nil
+	}
+	sanitized := make(map[string]model.ModelAssignment, len(assignments))
+	for phase, assignment := range assignments {
+		sanitized[phase] = sanitizeKnownModelEffort(assignment, sddModels)
+	}
+	return sanitized
+}
+
+func sanitizeKnownModelEffort(assignment model.ModelAssignment, sddModels map[string][]opencode.Model) model.ModelAssignment {
+	if assignment.Effort == "" {
+		return assignment
+	}
+
+	modelsForProvider, ok := sddModels[assignment.ProviderID]
+	if !ok {
+		return assignment
+	}
+
+	for _, available := range modelsForProvider {
+		if available.ID != assignment.ModelID {
+			continue
+		}
+		levels := available.EffortLevels()
+		if len(levels) == 0 {
+			if available.Reasoning {
+				return assignment
+			}
+			assignment.Effort = ""
+			return assignment
+		}
+		if containsString(levels, assignment.Effort) {
+			return assignment
+		}
+		assignment.Effort = ""
+		return assignment
+	}
+
+	return assignment
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 // TickMsg drives the spinner animation on the installing screen.
 type TickMsg time.Time
 
@@ -837,6 +889,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if m.ModelConfigMode {
 					m.ModelConfigMode = false
 					m.PendingSyncOverrides = &model.SyncOverrides{
+						TargetAgents:           []model.AgentID{model.AgentClaudeCode},
 						ClaudeModelAssignments: updated,
 					}
 					m = m.withResetSyncState()
@@ -883,6 +936,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if m.ModelConfigMode {
 					m.ModelConfigMode = false
 					m.PendingSyncOverrides = &model.SyncOverrides{
+						TargetAgents:         []model.AgentID{model.AgentKiroIDE},
 						KiroModelAssignments: updated,
 					}
 					m = m.withResetSyncState()
@@ -1403,7 +1457,12 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			if m.Selection.ModelAssignments == nil {
 				settingsPath := opencode.DefaultSettingsPath()
 				if current, err := readCurrentAssignmentsFn(settingsPath); err == nil && len(current) > 0 {
-					m.Selection.ModelAssignments = current
+					// Sanitize loaded assignments: clear any stale effort values for
+					// models that no longer report variants (e.g. provider refreshed
+					// their catalog since the user last synced). Without this, a stale
+					// effort would be preserved in the picker and re-injected on the
+					// next sync even if the model no longer supports that effort level.
+					m.Selection.ModelAssignments = sanitizeKnownModelEfforts(current, m.ModelPicker.SDDModels)
 				}
 			}
 			m.setScreen(ScreenModelPicker)
@@ -1599,7 +1658,8 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			if m.ModelConfigMode {
 				m.ModelConfigMode = false
 				m.PendingSyncOverrides = &model.SyncOverrides{
-					ModelAssignments: m.Selection.ModelAssignments,
+					TargetAgents:     []model.AgentID{model.AgentOpenCode},
+					ModelAssignments: sanitizeKnownModelEfforts(m.Selection.ModelAssignments, m.ModelPicker.SDDModels),
 					SDDMode:          model.SDDModeMulti,
 				}
 				m = m.withResetSyncState()
@@ -3365,16 +3425,17 @@ func (m Model) confirmProfileCreate() (tea.Model, tea.Cmd) {
 		}
 		if m.Cursor == len(rows) {
 			// "Continue": extract orchestrator + phase assignments, advance to confirm.
-			if m.Selection.ModelAssignments != nil {
+			assignments := sanitizeKnownModelEfforts(m.Selection.ModelAssignments, m.ModelPicker.SDDModels)
+			if assignments != nil {
 				// Extract orchestrator model.
-				if orch, ok := m.Selection.ModelAssignments[screens.SDDOrchestratorPhase]; ok {
+				if orch, ok := assignments[screens.SDDOrchestratorPhase]; ok {
 					m.ProfileDraft.OrchestratorModel = orch
 				}
 				// Copy all phase assignments (excluding orchestrator).
 				if m.ProfileDraft.PhaseAssignments == nil {
 					m.ProfileDraft.PhaseAssignments = make(map[string]model.ModelAssignment)
 				}
-				for k, v := range m.Selection.ModelAssignments {
+				for k, v := range assignments {
 					if k != screens.SDDOrchestratorPhase {
 						m.ProfileDraft.PhaseAssignments[k] = v
 					}
@@ -3399,7 +3460,8 @@ func (m Model) confirmProfileCreate() (tea.Model, tea.Cmd) {
 		case 0: // "Create & Sync" / "Save & Sync"
 			draft := m.ProfileDraft
 			m.PendingSyncOverrides = &model.SyncOverrides{
-				Profiles: []model.Profile{draft},
+				TargetAgents: []model.AgentID{model.AgentOpenCode},
+				Profiles:     []model.Profile{draft},
 			}
 			m = m.withResetSyncState()
 			m.setScreen(ScreenSync)

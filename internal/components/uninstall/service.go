@@ -1,6 +1,7 @@
 package uninstall
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -543,6 +544,10 @@ func (s *Service) componentOperations(adapter agents.Adapter, componentID model.
 			}
 			ops = append(ops, removeDirIfEmpty(commandsDir))
 		}
+		if path := adapter.SettingsPath(homeDir); path != "" && adapter.Agent() == model.AgentClaudeCode {
+			targets = append(targets, path)
+			ops = append(ops, rewriteClaudeSkillRegistryHook(path))
+		}
 		if path := adapter.SettingsPath(homeDir); path != "" && adapter.Agent() == model.AgentOpenCode {
 			targets = append(targets, path)
 			paths := make([]jsonPath, 0, len(sddPhaseAgents))
@@ -569,9 +574,24 @@ func (s *Service) componentOperations(adapter agents.Adapter, componentID model.
 
 			ops = append(ops, rewriteJSONFile(path, paths...))
 
-			pluginPath := filepath.Join(homeDir, ".config", "opencode", "plugins", "background-agents.ts")
-			targets = append(targets, pluginPath)
-			ops = append(ops, removeFile(pluginPath), removeDirIfEmpty(filepath.Dir(pluginPath)))
+			pluginDir := filepath.Join(homeDir, ".config", "opencode", "plugins")
+			for _, pluginPath := range []string{
+				filepath.Join(pluginDir, "background-agents.ts"),
+				filepath.Join(pluginDir, "model-variants.ts"),
+			} {
+				targets = append(targets, pluginPath)
+				ops = append(ops, removeFile(pluginPath))
+			}
+			ops = append(ops, removeDirIfEmpty(pluginDir))
+
+			modelVariantsCacheDir := filepath.Join(homeDir, ".gentle-ai", "cache")
+			for _, cachePath := range []string{
+				filepath.Join(modelVariantsCacheDir, "model-variants.json"),
+				filepath.Join(modelVariantsCacheDir, "model-variants.json.tmp"),
+			} {
+				targets = append(targets, cachePath)
+				ops = append(ops, removeFile(cachePath))
+			}
 
 			depDir := filepath.Join(homeDir, ".config", "opencode", "node_modules", "unique-names-generator")
 			targets = append(targets, depDir)
@@ -784,6 +804,103 @@ func rewriteJSONFile(path string, jsonPaths ...jsonPath) operation {
 			return true, false, nil
 		},
 	}
+}
+
+func rewriteClaudeSkillRegistryHook(path string) operation {
+	return operation{
+		typeID: opRewriteFile,
+		path:   path,
+		apply: func(path string) (bool, bool, error) {
+			raw, err := readManagedFile(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return false, false, nil
+				}
+				return false, false, fmt.Errorf("read Claude settings %q: %w", path, err)
+			}
+			updated, changed, err := removeClaudeSkillRegistryHook(raw)
+			if err != nil {
+				return false, false, fmt.Errorf("clean Claude skill-registry hook %q: %w", path, err)
+			}
+			if !changed {
+				return false, false, nil
+			}
+			if jsonIsEmptyObject(updated) {
+				if err := removeFileIfExists(path); err != nil {
+					return false, false, err
+				}
+				return true, true, nil
+			}
+			_, err = filemerge.WriteFileAtomic(path, updated, 0o644)
+			if err != nil {
+				return false, false, err
+			}
+			return true, false, nil
+		},
+	}
+}
+
+func removeClaudeSkillRegistryHook(raw []byte) ([]byte, bool, error) {
+	root := map[string]any{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, false, err
+	}
+	hooksMap, ok := root["hooks"].(map[string]any)
+	if !ok {
+		return raw, false, nil
+	}
+	changed := false
+	for _, hookKey := range []string{"UserPromptSubmit", "SessionStart"} {
+		entries, ok := hooksMap[hookKey].([]any)
+		if !ok {
+			continue
+		}
+		keptEntries := make([]any, 0, len(entries))
+		for _, entry := range entries {
+			entryMap, ok := entry.(map[string]any)
+			if !ok {
+				keptEntries = append(keptEntries, entry)
+				continue
+			}
+			hooks, ok := entryMap["hooks"].([]any)
+			if !ok {
+				keptEntries = append(keptEntries, entry)
+				continue
+			}
+			keptHooks := make([]any, 0, len(hooks))
+			for _, hook := range hooks {
+				hookMap, ok := hook.(map[string]any)
+				cmd, _ := hookMap["command"].(string)
+				if ok && strings.Contains(cmd, "gentle-ai skill-registry refresh") {
+					changed = true
+					continue
+				}
+				keptHooks = append(keptHooks, hook)
+			}
+			if len(keptHooks) == 0 {
+				changed = true
+				continue
+			}
+			entryMap["hooks"] = keptHooks
+			keptEntries = append(keptEntries, entryMap)
+		}
+		if len(keptEntries) == 0 {
+			delete(hooksMap, hookKey)
+		} else {
+			hooksMap[hookKey] = keptEntries
+		}
+	}
+	if !changed {
+		return raw, false, nil
+	}
+	if len(hooksMap) == 0 {
+		delete(root, "hooks")
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, false, err
+	}
+	return append(out, '\n'), true, nil
 }
 
 func rewriteTOMLFile(path string, mutate func(content string) (string, bool)) operation {

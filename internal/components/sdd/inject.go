@@ -627,7 +627,18 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 		}
 	}
 
-	// 4. Post-injection verification — catch silent failures.
+	// 4. Install skill-registry startup automation for agents with runtime hooks.
+	// This keeps `.atl/skill-registry.md` fresh without making the orchestrator
+	// spend tokens rescanning skills on every session. The command itself is
+	// fingerprint-cached, so normal startup is cheap.
+	automationResult, err := installSkillRegistryAutomation(homeDir, adapter)
+	if err != nil {
+		return InjectionResult{}, err
+	}
+	changed = changed || automationResult.Changed
+	files = append(files, automationResult.Files...)
+
+	// 5. Post-injection verification — catch silent failures.
 	// Primary: validate against the in-memory merged bytes to avoid false
 	// negatives on Windows/WSL2 where a freshly-renamed file may not be
 	// immediately visible via os.ReadFile.
@@ -886,6 +897,110 @@ func readMisnamedOpenCodeGentlemanSDDPrompt(settingsPath string) (string, error)
 	return prompt, nil
 }
 
+func installSkillRegistryAutomation(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
+	if adapter.Agent() != model.AgentClaudeCode {
+		return InjectionResult{}, nil
+	}
+	settingsPath := adapter.SettingsPath(homeDir)
+	if settingsPath == "" {
+		return InjectionResult{}, nil
+	}
+	changed, err := ensureClaudeSkillRegistryHook(settingsPath)
+	if err != nil {
+		return InjectionResult{}, fmt.Errorf("install Claude skill-registry hook: %w", err)
+	}
+	return InjectionResult{Changed: changed, Files: []string{settingsPath}}, nil
+}
+
+func ensureClaudeSkillRegistryHook(settingsPath string) (bool, error) {
+	root := map[string]any{}
+	if data, err := os.ReadFile(settingsPath); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+		if err := json.Unmarshal(data, &root); err != nil {
+			return false, fmt.Errorf("parse Claude settings %q: %w", settingsPath, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+
+	const command = `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "${CLAUDE_PROJECT_DIR:-$PWD}" || true`
+	if claudeHookExists(root, command) {
+		return false, nil
+	}
+
+	hooksRaw, hasHooks := root["hooks"]
+	hooksMap, _ := hooksRaw.(map[string]any)
+	if hasHooks && hooksMap == nil {
+		return false, fmt.Errorf("Claude settings %q has unsupported hooks shape: want object", settingsPath)
+	}
+	if hooksMap == nil {
+		hooksMap = map[string]any{}
+	}
+	promptRaw, hasUserPromptSubmit := hooksMap["UserPromptSubmit"]
+	userPromptSubmit, _ := promptRaw.([]any)
+	if hasUserPromptSubmit && userPromptSubmit == nil {
+		return false, fmt.Errorf("Claude settings %q has unsupported hooks.UserPromptSubmit shape: want array", settingsPath)
+	}
+	userPromptSubmit = append(userPromptSubmit, map[string]any{
+		"matcher": "",
+		"hooks": []any{
+			map[string]any{
+				"type":    "command",
+				"command": command,
+			},
+		},
+	})
+	hooksMap["UserPromptSubmit"] = userPromptSubmit
+	root["hooks"] = hooksMap
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	out = append(out, '\n')
+	wr, err := filemerge.WriteFileAtomic(settingsPath, out, 0o644)
+	if err != nil {
+		return false, err
+	}
+	return wr.Changed, nil
+}
+
+func claudeHookExists(root map[string]any, command string) bool {
+	hooksMap, ok := root["hooks"].(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, key := range []string{"UserPromptSubmit", "SessionStart"} {
+		hookEntries, ok := hooksMap[key].([]any)
+		if !ok {
+			continue
+		}
+		if claudeHookListContains(hookEntries, command) {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeHookListContains(hookEntries []any, command string) bool {
+	for _, item := range hookEntries {
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		hooks, ok := itemMap["hooks"].([]any)
+		if !ok {
+			continue
+		}
+		for _, hook := range hooks {
+			hookMap, ok := hook.(map[string]any)
+			if ok && hookMap["command"] == command {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // installOpenCodePlugins copies the background-agents plugin and installs its
 // npm/bun dependency into the agent's global config directory. Returns an error
 // with an actionable message if the package manager is present but the install
@@ -898,16 +1013,23 @@ func installOpenCodePlugins(homeDir string, adapter agents.Adapter) (InjectionRe
 		return InjectionResult{}, fmt.Errorf("create plugins dir: %w", err)
 	}
 
-	content := assets.MustRead("opencode/plugins/background-agents.ts")
-	pluginPath := filepath.Join(pluginsDir, "background-agents.ts")
+	var files []string
+	var changed bool
 
-	writeResult, err := filemerge.WriteFileAtomic(pluginPath, []byte(content), 0o644)
-	if err != nil {
-		return InjectionResult{}, fmt.Errorf("write plugin: %w", err)
+	for _, name := range []string{"background-agents.ts", "model-variants.ts"} {
+		content := assets.MustRead("opencode/plugins/" + name)
+		pluginPath := filepath.Join(pluginsDir, name)
+
+		writeResult, err := filemerge.WriteFileAtomic(pluginPath, []byte(content), 0o644)
+		if err != nil {
+			return InjectionResult{}, fmt.Errorf("write plugin %s: %w", name, err)
+		}
+
+		files = append(files, pluginPath)
+		if writeResult.Changed {
+			changed = true
+		}
 	}
-
-	files := []string{pluginPath}
-	changed := writeResult.Changed
 
 	// Install dependency — prefer bun (OpenCode uses it), fall back to npm.
 	// If neither is available, skip with a soft no-op (npm/bun not installed).
@@ -1463,7 +1585,6 @@ func injectMarkdownSections(homeDir string, adapter agents.Adapter, assignments 
 }
 
 var claudeModelAssignmentRowOrder = []string{
-	"orchestrator",
 	"sdd-explore",
 	"sdd-propose",
 	"sdd-spec",
@@ -1476,16 +1597,15 @@ var claudeModelAssignmentRowOrder = []string{
 }
 
 var claudeModelAssignmentReasons = map[string]string{
-	"orchestrator": "Coordinates, makes decisions",
-	"sdd-explore":  "Reads code, structural - not architectural",
-	"sdd-propose":  "Architectural decisions",
-	"sdd-spec":     "Structured writing",
-	"sdd-design":   "Architecture decisions",
-	"sdd-tasks":    "Mechanical breakdown",
-	"sdd-apply":    "Implementation",
-	"sdd-verify":   "Validation against spec",
-	"sdd-archive":  "Copy and close",
-	"default":      "Non-SDD general delegation",
+	"sdd-explore": "Reads code, structural - not architectural",
+	"sdd-propose": "Architectural decisions",
+	"sdd-spec":    "Structured writing",
+	"sdd-design":  "Architecture decisions",
+	"sdd-tasks":   "Mechanical breakdown",
+	"sdd-apply":   "Implementation",
+	"sdd-verify":  "Validation against spec",
+	"sdd-archive": "Copy and close",
+	"default":     "Non-SDD general delegation",
 }
 
 func injectClaudeModelAssignments(content string, assignments map[string]model.ClaudeModelAlias) (string, error) {
@@ -1531,6 +1651,8 @@ func renderClaudeModelAssignmentsSection(assignments map[string]model.ClaudeMode
 	var b strings.Builder
 	b.WriteString("## Model Assignments\n\n")
 	b.WriteString("Read this table at session start (or before first delegation), cache it for the session, and pass the mapped alias in every Agent tool call via the `model` parameter. If a phase is missing, use the `default` row. If you do not have access to the assigned model (for example, no Opus access), substitute `sonnet` and continue.\n\n")
+	b.WriteString("The Claude Code session model is controlled by Claude Code itself; Gentle AI does not configure the main orchestrator model. This table applies only to Agent tool calls for SDD phase sub-agents and general delegation.\n\n")
+	b.WriteString("**Mandatory model gate:** Every Agent tool call MUST include `model`. Calling Agent without `model` is invalid. Before each Agent call, resolve the target phase to an alias from this table; for general/non-SDD delegation use `default`. If you are about to call Agent and have not chosen a `model`, STOP and choose the mapped alias first.\n\n")
 	b.WriteString("| Phase | Default Model | Reason |\n")
 	b.WriteString("|-------|---------------|--------|\n")
 	for _, key := range claudeModelAssignmentRowOrder {
@@ -1553,7 +1675,9 @@ func renderClaudeModelAssignmentsSection(assignments map[string]model.ClaudeMode
 //     (existingAgentKeys) → skip; let the deep merge preserve whatever the
 //     user already has (including no model at all — that's intentional)
 //  3. Neither of the above AND rootModelID is set → inject rootModelID so the
-//     agent does not silently inherit the orchestrator model at runtime
+//     agent does not silently inherit the orchestrator model at runtime, and
+//     write variant="" to stay symmetric with case 1 and prevent stale variant
+//     leakage on the deep merge.
 //
 // If none of the above conditions apply, nothing is written for that agent.
 func injectModelAssignments(overlayBytes []byte, assignments map[string]model.ModelAssignment, rootModelID string, existingAgentKeys map[string]bool) ([]byte, error) {
@@ -1585,12 +1709,21 @@ func injectModelAssignments(overlayBytes []byte, assignments map[string]model.Mo
 		case hasExplicitAssignment && assignment.ProviderID != "" && assignment.ModelID != "":
 			// 1. TUI choice always wins
 			agentMap["model"] = assignment.FullID()
+			if assignment.Effort != "" {
+				agentMap["variant"] = assignment.Effort
+			} else {
+				agentMap["variant"] = ""
+			}
 		case existingAgentKeys[phase]:
 			// 2. Agent already exists in user's config — let merge preserve whatever they have
 			// (don't touch the overlay for this agent's model)
 		case rootModelID != "":
-			// 3. Fresh install or new agent: use root model as default to break inheritance
+			// 3. Fresh install or new agent: use root model as default to break inheritance.
+			// Also clear variant explicitly so the overlay output stays symmetric
+			// with case 1 — this prevents a stale variant from leaking through if
+			// the embedded overlay or upstream pipeline ever carries a variant.
 			agentMap["model"] = rootModelID
+			agentMap["variant"] = ""
 		}
 	}
 
